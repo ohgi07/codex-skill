@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Test double for the `codex` CLI. Records how it was called and emits canned
+# output shaped like `codex exec --json`. See test-unit.sh for the env contract.
+set -u
+
+: "${FAKE_CODEX_ARGS:?FAKE_CODEX_ARGS must point to a file}"
+printf '%s\n' "$@" > "$FAKE_CODEX_ARGS"
+
+if [ ! -t 0 ] && [ -n "${FAKE_CODEX_STDIN:-}" ]; then
+  cat > "$FAKE_CODEX_STDIN"
+fi
+
+# Locate the file after `-o`, if any, and write the canned final message there.
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+if [ -n "$out" ]; then
+  printf '%s' "${FAKE_CODEX_MSG:-fake answer}" > "$out"
+fi
+
+if [ -n "${FAKE_CODEX_TOUCH:-}" ]; then
+  : > "$FAKE_CODEX_TOUCH"
+fi
+
+if printf '%s\n' "$@" | grep -qx -- '--json'; then
+  printf '{"type":"thread.started","thread_id":"%s"}\n' "${FAKE_CODEX_THREAD-fake-thread-1}"
+  printf '{"type":"turn.completed","usage":{}}\n'
+else
+  echo "fake review output"
+fi
+
+rc="${FAKE_CODEX_RC:-0}"
+if [ "$rc" != 0 ]; then
+  echo "fake error on stderr" >&2
+fi
+exit "$rc"

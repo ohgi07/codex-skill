@@ -151,6 +151,10 @@ build_cmd() {
   esac
 }
 
+looks_like_uuid() {
+  [[ "${1-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
 print_header() {
   local cwd; cwd="$(pwd -W 2>/dev/null || pwd)"
   echo "[codex $MODE] cwd=$cwd model=${MODEL:-default}"
@@ -175,6 +179,12 @@ run_json_mode() {
   if [ "$rc" -ne 0 ]; then report_failure "$rc"; return "$rc"; fi
 
   local tid; tid="$(extract_thread_id "$LOG")"
+  if [ "$MODE" = resume ] && [ -n "$SESSION_ID" ] && looks_like_uuid "$SESSION_ID" && [ -n "$tid" ] \
+     && [ "${tid,,}" != "${SESSION_ID,,}" ]; then
+    KEEP_LOG=1
+    echo "codex-run: requested session $SESSION_ID but codex started thread $tid; session was NOT resumed" >&2
+    return 1
+  fi
   [ -z "$tid" ] || echo "session: $tid"
   echo
   if [ -s "$OUT_FILE" ]; then cat "$OUT_FILE"; echo; fi

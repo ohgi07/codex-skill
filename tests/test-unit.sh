@@ -177,6 +177,47 @@ rm -rf "$TMPDIR/codex-run"
 
 ! grep -q dangerously "$RUN" && ok "wrapper contains no dangerously-* flag" || fail "wrapper contains no dangerously-* flag"
 
+# ---------------------------------------------------------------- resume
+UUID_A="11111111-2222-3333-4444-555555555555"
+UUID_B="99999999-8888-7777-6666-555555555555"
+
+reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
+assert_eq "resume --last -> rc 0" "$RC" 0
+assert_contains "resume --last -> argv" "$(args_str)" "exec resume --last --skip-git-repo-check --json -o "
+assert_contains "resume default -> sandbox read-only" "$(args_str)" ' -c sandbox_mode="read-only" '
+assert_not_contains "resume -> no --color (unsupported on resume)" "$(args_str)" "--color"
+assert_not_contains "resume -> no -s flag" "$(args_str)" " -s "
+assert_eq "resume -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "follow up"
+assert_not_contains "resume read-only -> no trailer" "$OUT" "--- git status after Codex ---"
+assert_contains "resume -> header" "$OUT" "[codex resume] cwd="
+
+reset_fake; FAKE_CODEX_TOUCH="$REPO/resumed.txt" run_wrapper resume -C "$REPO" --last --mode workspace-write "write it"
+assert_eq "resume ww -> rc 0" "$RC" 0
+assert_contains "resume ww -> sandbox workspace-write" "$(args_str)" ' -c sandbox_mode="workspace-write" '
+assert_contains "resume ww -> trailer" "$OUT" "--- git status after Codex ---"
+assert_contains "resume ww -> trailer lists file" "$OUT" "?? resumed.txt"
+
+reset_fake; FAKE_CODEX_THREAD="$UUID_A" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
+assert_eq "resume matching id -> rc 0" "$RC" 0
+assert_contains "resume id -> argv has id" "$(args_str)" "exec resume $UUID_A "
+assert_contains "resume matching id -> session line" "$OUT" "session: $UUID_A"
+
+reset_fake; FAKE_CODEX_THREAD="$(tr 'a-f' 'A-F' <<< "$UUID_A")" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
+assert_eq "resume id case-insensitive match -> rc 0" "$RC" 0
+
+reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
+assert_eq "resume mismatched id -> rc 1" "$RC" 1
+assert_contains "resume mismatch -> message" "$ERR" "session was NOT resumed"
+assert_contains "resume mismatch -> log kept" "$ERR" "events log kept at "
+assert_not_contains "resume mismatch -> no answer printed" "$OUT" "fake answer"
+rm -rf "$TMPDIR/codex-run"
+
+reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" "my-thread-name" "hi"
+assert_eq "resume by thread name -> no mismatch check, rc 0" "$RC" 0
+
+reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" --last "hi"
+assert_eq "resume --last -> no mismatch check" "$RC" 0
+
 # ---------------------------------------------------------------- summary
 echo
 echo "passed=$PASS failed=$FAIL"

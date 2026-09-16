@@ -242,6 +242,19 @@ assert_eq "review failure -> same rc" "$RC" 2
 assert_contains "review failure -> stderr tail" "$ERR" "fake error on stderr"
 rm -rf "$TMPDIR/codex-run"
 
+# ---------------------------------------------------------------- SKILL.md
+SKILL="$HERE/../SKILL.md"
+[ -f "$SKILL" ] && ok "SKILL.md exists" || fail "SKILL.md exists"
+assert_eq "SKILL.md frontmatter opens" "$(head -n 1 "$SKILL" 2>/dev/null)" "---"
+assert_contains "SKILL.md name" "$(head -n 5 "$SKILL" 2>/dev/null)" "name: codex"
+for trig in "codex" "코덱스" "codex 리뷰" "codex한테 시켜" "코덱스한테도 물어봐" "Codex second opinion"; do
+  assert_contains "SKILL.md trigger: $trig" "$(head -n 4 "$SKILL" 2>/dev/null)" "$trig"   # description is line 3
+done
+assert_contains "SKILL.md mentions git diff rule" "$(cat "$SKILL" 2>/dev/null)" "git diff"
+assert_contains "SKILL.md mentions timeout" "$(cat "$SKILL" 2>/dev/null)" "600000"
+assert_contains "SKILL.md mentions resume default read-only" "$(cat "$SKILL" 2>/dev/null)" "--mode workspace-write"
+[ -f "$HERE/../DESIGN.md" ] && ok "DESIGN.md exists" || fail "DESIGN.md exists"
+
 # ---------------------------------------------------------------- summary
 echo
 echo "passed=$PASS failed=$FAIL"

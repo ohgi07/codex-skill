@@ -1,7 +1,7 @@
 # Codex skill for Claude Code — design
 
 Date: 2026-09-16
-Status: approved (brainstorm complete)
+Status: implemented (mode table updated with what the smoke test on Codex 0.154.0 / Windows actually required)
 
 ## Goal
 
@@ -67,10 +67,25 @@ codex-run.sh resume   [-C DIR] (--last | SESSION_ID) [--mode read-only|workspace
 
 | mode | command | permissions |
 |---|---|---|
-| `review` | `codex exec -s read-only --color never review <target> -c sandbox_mode="read-only"` — default target `--uncommitted` | read-only, enforced by the wrapper (not assumed from the reviewer). `-s` lives on `exec` (the `review` subcommand has no `-s`); the `-c sandbox_mode` override is added on `review` as well so the guarantee does not depend on how the parent flag propagates. |
-| `ask` | `codex exec -s read-only --json -o OUT --skip-git-repo-check -` | read-only |
-| `delegate` | `codex exec -s workspace-write --approve-for-me --json -o OUT --skip-git-repo-check -` | workspace-write; approval requests are routed through Codex automatic review, subject to the effective policy/config |
-| `resume` | `codex exec resume (--last \| ID) -c sandbox_mode="<mode>" --json -o OUT --skip-git-repo-check -` | resumes conversation context; execution permissions are resolved from **this** invocation, default `read-only` |
+| `review` | `codex exec -s read-only --color never review <target> -c sandbox_mode="read-only" RO PLAT` — default target `--uncommitted` | read-only, enforced by the wrapper (not assumed from the reviewer). `-s` lives on `exec` (the `review` subcommand has no `-s`); the `-c sandbox_mode` override is added on `review` as well so the guarantee does not depend on how the parent flag propagates. |
+| `ask` | `codex exec -s read-only RO PLAT --json -o OUT --skip-git-repo-check -` | read-only |
+| `delegate` | `codex exec --approve-for-me PLAT --json -o OUT --skip-git-repo-check -` | workspace-write; approval requests are routed through Codex automatic review, subject to the effective policy/config. **No explicit `-s`**: in 0.154.0 `--approve-for-me` is mutually exclusive with `--sandbox` (verified: `error: the argument '--sandbox <SANDBOX_MODE>' cannot be used with '--approve-for-me'`) and already selects the workspace-write sandbox. |
+| `resume` | `codex exec resume (--last \| ID) POLICY PLAT --json -o OUT --skip-git-repo-check -` | resumes conversation context; execution permissions are resolved from **this** invocation, default `read-only` |
+
+Where:
+
+- `RO` = `-c approval_policy="never"` — removes the only path out of a read-only sandbox (an approved escalation). Verified: with the user's `approvals_reviewer = "auto_review"` config and without `RO`, a read-only run still wrote a file.
+- `POLICY` for `resume` = `-c sandbox_mode="read-only" RO` (default) or, for `--mode workspace-write`, `-c sandbox_mode="workspace-write" -c approval_policy="on-request" -c approvals_reviewer="auto_review"` — exactly what `--approve-for-me` expands to in 0.154.0 (from the binary's own strings), spelled out because `exec resume` has no such flag.
+- `PLAT` = `-c windows.sandbox="<level>"` on Windows only (`$OSTYPE` is `msys*` or `cygwin*`), level from `CODEX_RUN_WINDOWS_SANDBOX` (`unelevated` default, `elevated` allowed, anything else is a usage error). See "Windows sandbox" below.
+
+### Windows sandbox
+
+Smoke-testing on the user's Windows 10 machine showed that Codex 0.154.0 has **no OS sandbox on Windows unless its Windows sandbox backend is enabled** (`[windows] sandbox = "unelevated" | "elevated"` in config.toml; docs: learn.chatgpt.com/docs/windows/windows-sandbox). Without it:
+
+- `-s read-only` on its own did not stop a write (`codex exec -s read-only "create a.txt"` → file created; the command ran through PowerShell, no approval event, `auto_review` in effect).
+- `-s read-only -c approval_policy="never"` stopped the write but also every read (`Get-Content` "blocked by policy"), because PowerShell commands are not in Codex's safe-command list. Same with `--ignore-user-config`.
+
+With `-c windows.sandbox="unelevated"` (restricted token + ACL boundary, no admin needed), read-only is enforced by the OS: reads and directory listings succeed, and `[System.IO.File]::WriteAllText`, `Set-Content`, `New-Item` and `cmd /c echo >` all fail with `UnauthorizedAccessException`; `--approve-for-me` still writes inside the workspace. The wrapper therefore passes it on every Windows invocation rather than depending on the user's config.toml. Sandboxed commands have no network access, so `ask`/`review` cannot fetch URLs.
 
 Facts about `codex exec resume` in 0.154.0 that drive the design (verified via
 `--help`): it accepts `-m`, `--json`, `-o`, `--skip-git-repo-check`, `-c`; it
@@ -79,16 +94,17 @@ sandbox is enforced with `-c sandbox_mode=...` and the default is `read-only`
 so `ask → resume` can never silently gain write access.
 `--mode workspace-write` must be explicit.
 
-If the `resume --mode workspace-write` smoke test stalls on an approval prompt,
-the implementer looks up the approval-related `-c` key that 0.154.0 actually
-honours and adds it to the resume policy then — not guessed in advance.
+(Resolved during the smoke test: the approval keys 0.154.0 honours are
+`approval_policy` and `approvals_reviewer`; see the mode table above.)
 
 The wrapper exposes no way to pass `--dangerously-bypass-approvals-and-sandbox`
 or `--dangerously-bypass-hook-trust`.
 
 Sandbox invariants the wrapper guarantees on its own, without relying on Codex
-subcommand defaults: `review` and `ask` always carry `-s read-only`; `resume`
-always carries an explicit `-c sandbox_mode=...`; only `delegate` and
+subcommand defaults or the user's config.toml: `review` and `ask` always carry
+`-s read-only` plus `approval_policy="never"`; `resume` always carries an
+explicit `-c sandbox_mode=...` plus the matching approval policy; on Windows
+every mode carries `-c windows.sandbox=...`; only `delegate` and
 `resume --mode workspace-write` can write.
 
 ### Resume session verification

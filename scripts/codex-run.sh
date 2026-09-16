@@ -6,10 +6,14 @@
 #   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 #   codex-run.sh resume   [-C DIR] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
 #
-# Sandbox invariants enforced here, not assumed from Codex defaults:
-#   review/ask  -> -s read-only
-#   delegate    -> -s workspace-write --approve-for-me
-#   resume      -> -c sandbox_mode="<--mode>", default read-only
+# Sandbox invariants enforced here, not assumed from Codex defaults (verified against Codex 0.154.0):
+#   review/ask            -> -s read-only + approval_policy="never"  (no escalation path out of the sandbox)
+#   delegate              -> --approve-for-me  (= sandbox_mode=workspace-write + approval_policy=on-request
+#                            + approvals_reviewer=auto_review; mutually exclusive with -s in 0.154.0)
+#   resume                -> -c sandbox_mode="<--mode>" with the matching policy above; default read-only
+#   Windows (msys/cygwin) -> -c windows.sandbox="unelevated" on every call. Without Codex's Windows sandbox
+#                            backend there is NO sandbox on Windows and "read-only" is not enforced at all.
+#                            CODEX_RUN_WINDOWS_SANDBOX=elevated selects the stronger backend once set up.
 # This script never passes any flag that bypasses sandboxing or approvals.
 
 usage() {
@@ -28,7 +32,9 @@ Modes:
   resume    Continue a previous session. Permissions come from --mode (default read-only).
 
 Prompt: last positional argument, or `-` / omitted to read stdin (heredoc-friendly).
-Env:    CODEX_RUN_KEEP_LOG=1 keeps the raw JSONL event log even on success.
+Env:    CODEX_RUN_KEEP_LOG=1                keeps the raw JSONL event log even on success.
+        CODEX_RUN_WINDOWS_SANDBOX=elevated  (Windows only) use Codex's elevated sandbox backend instead of
+                                            the default "unelevated" restricted-token one.
 USAGE
 }
 
@@ -129,25 +135,53 @@ parse_args() {
   esac
 }
 
+# set_platform_args -> sets PLATFORM_ARGS (array). On Windows (Git Bash reports msys or cygwin) Codex has
+# no OS sandbox unless its Windows sandbox backend is enabled, so `-s read-only` would not be enforced.
+# Enable it per invocation instead of relying on the user's config.toml.
+set_platform_args() {
+  PLATFORM_ARGS=()
+  case "${OSTYPE:-}" in
+    msys*|cygwin*)
+      local level="${CODEX_RUN_WINDOWS_SANDBOX:-unelevated}"
+      case "$level" in
+        unelevated|elevated) ;;
+        *) die "CODEX_RUN_WINDOWS_SANDBOX must be unelevated or elevated (got: $level)" ;;
+      esac
+      PLATFORM_ARGS=(-c "windows.sandbox=\"$level\"") ;;
+  esac
+}
+
 # build_cmd -> sets CMD (array). Uses MODE MODEL EFFORT REVIEW_TARGET RESUME_LAST SESSION_ID RESUME_MODE OUT_FILE.
 build_cmd() {
   CFG_ARGS=(); MODEL_ARGS=()
   [ -z "$EFFORT" ] || CFG_ARGS+=(-c "model_reasoning_effort=\"$EFFORT\"")
   [ -z "$MODEL" ]  || MODEL_ARGS+=(-m "$MODEL")
+  set_platform_args
+
+  # Read-only: approval_policy=never removes the only path out of the sandbox (an approved escalation).
+  # Write: exactly what `--approve-for-me` expands to in 0.154.0, spelled out for `resume`, which has no such flag.
+  local -a ro_policy=(-c 'approval_policy="never"')
+  local -a ww_policy=(-c 'sandbox_mode="workspace-write"' -c 'approval_policy="on-request"' -c 'approvals_reviewer="auto_review"')
 
   case "$MODE" in
     review)
       # -s goes on `exec` (review has no -s); -c sandbox_mode is added on `review` too so the
       # read-only guarantee does not depend on how the parent flag propagates.
-      CMD=(codex exec -s read-only --color never review "${REVIEW_TARGET[@]}" -c 'sandbox_mode="read-only"' "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}") ;;
+      CMD=(codex exec -s read-only --color never review "${REVIEW_TARGET[@]}" -c 'sandbox_mode="read-only"' "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}") ;;
     ask)
-      CMD=(codex exec -s read-only --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      CMD=(codex exec -s read-only "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
     delegate)
-      CMD=(codex exec -s workspace-write --approve-for-me --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      # --approve-for-me already selects the workspace-write sandbox; 0.154.0 rejects it combined with -s.
+      CMD=(codex exec --approve-for-me "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
     resume)
-      local -a target
+      local -a target policy
       if [ "$RESUME_LAST" -eq 1 ]; then target=(--last); else target=("$SESSION_ID"); fi
-      CMD=(codex exec resume "${target[@]}" --skip-git-repo-check --json -o "$OUT_FILE" -c "sandbox_mode=\"$RESUME_MODE\"" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      if [ "$RESUME_MODE" = workspace-write ]; then
+        policy=("${ww_policy[@]}")
+      else
+        policy=(-c 'sandbox_mode="read-only"' "${ro_policy[@]}")
+      fi
+      CMD=(codex exec resume "${target[@]}" --skip-git-repo-check --json -o "$OUT_FILE" "${policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
   esac
 }
 

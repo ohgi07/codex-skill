@@ -36,12 +36,13 @@ Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|�
 5. **Attribute Codex's answer as Codex's** (e.g. "Codex says: …") and keep your own assessment clearly separate.
 6. **`resume` defaults to read-only.** Pass `--mode workspace-write` only when the follow-up is meant to edit files.
 7. **Never** edit the wrapper to add `--dangerously-*` flags, and never call `codex` directly with them.
+8. **Read-only modes run Codex in a real sandbox** (`ask`, `review`, `resume` without `--mode workspace-write`): writes are refused at the OS level and there is **no network access**, so don't ask Codex to fetch URLs or install packages there. On Windows the wrapper enables Codex's Windows sandbox backend per call (`unelevated`); if the user has set up the elevated backend, they can export `CODEX_RUN_WINDOWS_SANDBOX=elevated`.
 
 ## Output format
 
 ```
 [codex <mode>] cwd=<dir> model=<model|default>
-session: <id>                      ← use this with `resume <id>`
+session: <id>                      ← use this with `resume <id>` (not printed by `review`)
 
 <Codex's final message>
 

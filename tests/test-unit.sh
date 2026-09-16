@@ -32,6 +32,10 @@ run_wrapper() {
   OUT="$(cat "$o")"; ERR="$(cat "$e")"
 }
 log_count() { find "$TMPDIR/codex-run" -type f 2>/dev/null | wc -l | tr -d ' '; }
+# Platform-specific argv the wrapper adds (Windows needs Codex's Windows sandbox backend enabled).
+case "${OSTYPE:-}" in msys*|cygwin*) PLAT=' -c windows.sandbox="unelevated"';; *) PLAT='';; esac
+RO_POLICY=' -c approval_policy="never"'
+WW_POLICY=' -c sandbox_mode="workspace-write" -c approval_policy="on-request" -c approvals_reviewer="auto_review"'
 
 # ---------------------------------------------------------------- shim sanity
 reset_fake
@@ -116,7 +120,9 @@ assert_eq "extract_thread_id no thread.started under pipefail -> empty, no abort
 # ---------------------------------------------------------------- ask
 reset_fake; run_wrapper ask -C "$WORK" "what is this"
 assert_eq "ask -> rc 0" "$RC" 0
-assert_contains "ask -> argv" "$(args_str)" "exec -s read-only --color never --skip-git-repo-check --json -o "
+assert_contains "ask -> argv" "$(args_str)" "exec -s read-only${RO_POLICY}${PLAT} --color never --skip-git-repo-check --json -o "
+assert_not_contains "ask -> no write policy" "$(args_str)" "workspace-write"
+assert_not_contains "ask -> no approve-for-me" "$(args_str)" "approve"
 assert_eq "ask -> prompt via stdin '-'" "$(tail -n 1 "$FAKE_CODEX_ARGS")" "-"
 assert_eq "ask -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "what is this"
 assert_contains "ask -> header" "$OUT" "[codex ask] cwd="
@@ -148,7 +154,9 @@ REPO="$WORK/repo"; rm -rf "$REPO"; mkdir -p "$REPO"
 git -C "$REPO" init -q && git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 reset_fake; FAKE_CODEX_TOUCH="$REPO/new.txt" run_wrapper delegate -C "$REPO" "make a file"
 assert_eq "delegate -> rc 0" "$RC" 0
-assert_contains "delegate -> argv" "$(args_str)" "exec -s workspace-write --approve-for-me --color never --skip-git-repo-check --json -o "
+assert_contains "delegate -> argv" "$(args_str)" "exec --approve-for-me${PLAT} --color never --skip-git-repo-check --json -o "
+assert_not_contains "delegate -> no -s (mutually exclusive with --approve-for-me in 0.154.0)" "$(args_str)" " -s "
+assert_not_contains "delegate -> no approval_policy=never" "$(args_str)" 'approval_policy="never"'
 assert_contains "delegate -> header" "$OUT" "[codex delegate] cwd="
 assert_contains "delegate -> trailer" "$OUT" "--- git status after Codex ---"
 assert_contains "delegate -> trailer lists file" "$OUT" "?? new.txt"
@@ -185,6 +193,8 @@ reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
 assert_eq "resume --last -> rc 0" "$RC" 0
 assert_contains "resume --last -> argv" "$(args_str)" "exec resume --last --skip-git-repo-check --json -o "
 assert_contains "resume default -> sandbox read-only" "$(args_str)" ' -c sandbox_mode="read-only" '
+assert_contains "resume default -> read-only policy" "$(args_str)" " -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
+assert_not_contains "resume default -> no auto_review" "$(args_str)" "auto_review"
 assert_not_contains "resume -> no --color (unsupported on resume)" "$(args_str)" "--color"
 assert_not_contains "resume -> no -s flag" "$(args_str)" " -s "
 assert_eq "resume -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "follow up"
@@ -194,6 +204,8 @@ assert_contains "resume -> header" "$OUT" "[codex resume] cwd="
 reset_fake; FAKE_CODEX_TOUCH="$REPO/resumed.txt" run_wrapper resume -C "$REPO" --last --mode workspace-write "write it"
 assert_eq "resume ww -> rc 0" "$RC" 0
 assert_contains "resume ww -> sandbox workspace-write" "$(args_str)" ' -c sandbox_mode="workspace-write" '
+assert_contains "resume ww -> replicates --approve-for-me" "$(args_str)" "${WW_POLICY}${PLAT} "
+assert_not_contains "resume ww -> no approval_policy=never" "$(args_str)" 'approval_policy="never"'
 assert_contains "resume ww -> trailer" "$OUT" "--- git status after Codex ---"
 assert_contains "resume ww -> trailer lists file" "$OUT" "?? resumed.txt"
 
@@ -225,22 +237,33 @@ assert_eq "resume --last -> no mismatch check" "$RC" 0
 # ---------------------------------------------------------------- review
 reset_fake; run_wrapper review -C "$REPO"
 assert_eq "review default -> rc 0" "$RC" 0
-assert_eq "review default -> argv" "$(args_str)" 'exec -s read-only --color never review --uncommitted -c sandbox_mode="read-only" '
+assert_eq "review default -> argv" "$(args_str)" "exec -s read-only --color never review --uncommitted -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 assert_contains "review -> header" "$OUT" "[codex review] cwd="
 assert_contains "review -> passthrough output" "$OUT" "fake review output"
 assert_not_contains "review -> no --json" "$(args_str)" "--json"
 assert_eq "review success -> no log left" "$(log_count)" 0
 
 reset_fake; run_wrapper review -C "$REPO" --base main
-assert_eq "review --base -> argv" "$(args_str)" 'exec -s read-only --color never review --base main -c sandbox_mode="read-only" '
+assert_eq "review --base -> argv" "$(args_str)" "exec -s read-only --color never review --base main -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 
 reset_fake; run_wrapper review -C "$REPO" --commit abc123 -m gpt-test --effort low
-assert_eq "review --commit -m --effort -> argv" "$(args_str)" 'exec -s read-only --color never review --commit abc123 -c sandbox_mode="read-only" -c model_reasoning_effort="low" -m gpt-test '
+assert_eq "review --commit -m --effort -> argv" "$(args_str)" "exec -s read-only --color never review --commit abc123 -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} -c model_reasoning_effort=\"low\" -m gpt-test "
 
 reset_fake; FAKE_CODEX_RC=2 run_wrapper review -C "$REPO"
 assert_eq "review failure -> same rc" "$RC" 2
 assert_contains "review failure -> stderr tail" "$ERR" "fake error on stderr"
 rm -rf "$TMPDIR/codex-run"
+
+# ---------------------------------------------------------------- platform sandbox args
+n="$( ( source "$RUN"; OSTYPE=linux-gnu; set_platform_args; echo "${#PLATFORM_ARGS[@]}" ) )"
+assert_eq "non-Windows -> no platform args" "$n" 0
+p="$( ( source "$RUN"; OSTYPE=msys; set_platform_args; printf '%s ' "${PLATFORM_ARGS[@]}" ) )"
+assert_eq "Windows (msys) -> unelevated sandbox by default" "$p" '-c windows.sandbox="unelevated" '
+p="$( ( source "$RUN"; OSTYPE=cygwin; CODEX_RUN_WINDOWS_SANDBOX=elevated set_platform_args; printf '%s ' "${PLATFORM_ARGS[@]}" ) )"
+assert_eq "Windows (cygwin) + CODEX_RUN_WINDOWS_SANDBOX=elevated" "$p" '-c windows.sandbox="elevated" '
+( source "$RUN"; OSTYPE=msys; CODEX_RUN_WINDOWS_SANDBOX=disabled set_platform_args ) >/dev/null 2>"$WORK/plat.err"; rc=$?
+assert_eq "CODEX_RUN_WINDOWS_SANDBOX=disabled -> rejected" "$rc" 1
+assert_contains "CODEX_RUN_WINDOWS_SANDBOX=disabled -> message" "$(cat "$WORK/plat.err")" "CODEX_RUN_WINDOWS_SANDBOX"
 
 # ---------------------------------------------------------------- SKILL.md
 SKILL="$HERE/../SKILL.md"

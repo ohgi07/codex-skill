@@ -51,7 +51,7 @@ session: <id>                      ← use this with `resume <id>` (not printed 
 ?? src/bar.ts
 ```
 
-On failure the wrapper prints Codex's stderr tail and `codex-run: events log kept at <path>` (raw JSONL for debugging). `CODEX_RUN_KEEP_LOG=1` keeps the log on success too.
+On failure the wrapper prints Codex's stderr tail and, when there is a JSONL event log (`ask`/`delegate`/`resume`), `codex-run: events log kept at <path>` for debugging. `CODEX_RUN_KEEP_LOG=1` keeps the log on success too.
 
 ## Examples
 

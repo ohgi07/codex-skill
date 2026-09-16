@@ -5,6 +5,7 @@
 #   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 #   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 #   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+#   codex-run.sh status   [-C DIR] [--last | SESSION_ID]
 #
 # Sandbox invariants enforced here, not assumed from Codex defaults (verified against Codex 0.154.0):
 #   review/ask            -> -s read-only + approval_policy="never"  (no escalation path out of the sandbox)
@@ -23,6 +24,7 @@ usage() {
   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+  codex-run.sh status   [-C DIR] [--last | SESSION_ID]
 
 Modes:
   review    Codex's built-in code review of the repo in DIR (read-only). Default target: --uncommitted.
@@ -30,6 +32,10 @@ Modes:
   ask       Read-only question about the code in DIR. Codex can read files, not write.
   delegate  Let Codex edit files in DIR (workspace-write; approvals go through Codex automatic review).
   resume    Continue a previous session. Permissions come from --mode (default read-only).
+  status    Codex version/login, config.toml model/effort/reviewer, the policy this wrapper applies, and the
+            rate-limit usage Codex last recorded. With --last (newest session in DIR) or SESSION_ID also shows
+            that session's effective model/sandbox/approval and token totals. Reads \$CODEX_HOME/sessions only;
+            no API call.
 
 Prompt: last positional argument, or \`-\` / omitted to read stdin (heredoc-friendly).
 Env:    CODEX_RUN_KEEP_LOG=1                keeps the raw JSONL event log even on success.
@@ -73,8 +79,8 @@ parse_args() {
   case "$MODE" in
     -h|--help) usage; exit 0 ;;
     "") usage >&2; exit 1 ;;
-    review|ask|delegate|resume) shift ;;
-    *) die "unknown mode: $MODE (expected review|ask|delegate|resume)" ;;
+    review|ask|delegate|resume|status) shift ;;
+    *) die "unknown mode: $MODE (expected review|ask|delegate|resume|status)" ;;
   esac
 
   DIR="$PWD"; MODEL=""; EFFORT=""
@@ -86,8 +92,10 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -C)       { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "-C needs a directory"; DIR="$2"; shift 2 ;;
-      -m)       { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "-m needs a model"; MODEL="$2"; shift 2 ;;
-      --effort) { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "--effort needs a value"; EFFORT="$2"; shift 2 ;;
+      -m)       [ "$MODE" != status ] || die "-m is not valid for status"
+                { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "-m needs a model"; MODEL="$2"; shift 2 ;;
+      --effort) [ "$MODE" != status ] || die "--effort is not valid for status"
+                { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "--effort needs a value"; EFFORT="$2"; shift 2 ;;
       --uncommitted)
         [ "$MODE" = review ] || die "--uncommitted is only valid for review"
         REVIEW_TARGET=(--uncommitted); target_count=$((target_count+1)); shift ;;
@@ -100,7 +108,7 @@ parse_args() {
         { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "--commit needs a sha"
         REVIEW_TARGET=(--commit "$2"); target_count=$((target_count+1)); shift 2 ;;
       --last)
-        [ "$MODE" = resume ] || die "--last is only valid for resume"
+        case "$MODE" in resume|status) ;; *) die "--last is only valid for resume or status" ;; esac
         RESUME_LAST=1; shift ;;
       --mode)
         [ "$MODE" = resume ] || die "--mode is only valid for resume"
@@ -134,6 +142,15 @@ parse_args() {
         SESSION_ID="${pos[0]}"
         looks_like_uuid "$SESSION_ID" || die "SESSION_ID must be the UUID printed on the session: line (got: '$SESSION_ID')"
         PROMPT_ARG="${pos[1]-}"
+      fi
+      ;;
+    status)
+      [ "${#pos[@]}" -le 1 ] || die "unexpected extra argument: ${pos[1]}"
+      if [ "$RESUME_LAST" -eq 1 ]; then
+        [ "${#pos[@]}" -eq 0 ] || die "pass either --last or SESSION_ID, not both"
+      elif [ "${#pos[@]}" -eq 1 ]; then
+        SESSION_ID="${pos[0]}"
+        looks_like_uuid "$SESSION_ID" || die "SESSION_ID must be the UUID printed on the session: line (got: '$SESSION_ID')"
       fi
       ;;
   esac
@@ -241,6 +258,167 @@ run_review() {
   return 0
 }
 
+# ---------------------------------------------------------------- status (offline; reads $CODEX_HOME)
+# Codex 0.154.0 writes one rollout file per session under $CODEX_HOME/sessions/YYYY/MM/DD/
+# rollout-<timestamp>-<session-id>.jsonl. Line 1 is session_meta (cwd); turn_context lines carry the
+# effective model/effort/sandbox/approval; token_count events carry cumulative usage and rate limits.
+# Parsed with grep/sed only (no jq), like extract_thread_id.
+
+# jget JSON KEY -> first value of "KEY": either a string or a bare number/word. Empty if absent.
+jget() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p; t; s/.*\"$2\":\([^,}]*\).*/\1/p" | head -n 1
+}
+
+# fmt_time SPEC -> local time for an ISO-8601 string or @EPOCH; falls back to the raw value.
+fmt_time() { date -d "$1" '+%Y-%m-%d %H:%M %z' 2>/dev/null || printf '%s' "$1"; }
+
+# fmt_window MINUTES -> "weekly", "5h window", "3d window", "30m window".
+fmt_window() {
+  case "$1" in
+    10080) echo weekly ;;
+    *) if   [ "$1" -ge 1440 ] && [ $(( $1 % 1440 )) -eq 0 ]; then echo "$(( $1 / 1440 ))d window"
+       elif [ "$1" -ge 60 ]   && [ $(( $1 % 60 )) -eq 0 ];   then echo "$(( $1 / 60 ))h window"
+       else echo "${1}m window"; fi ;;
+  esac
+}
+
+# fmt_pct 19.0 -> 19 ; 77.5 -> 77.5
+fmt_pct() { printf '%s' "$1" | sed 's/\.0$//'; }
+
+# norm_path PATH -> lowercase, forward slashes, no trailing slash (Codex records cwd as C:\\Users\\... on Windows).
+norm_path() {
+  local p="$1"
+  p="${p//\\\\/\\}"; p="${p//\\//}"; p="${p%/}"
+  printf '%s' "${p,,}"
+}
+
+# all_rollouts -> rollout files, newest first (date directories + timestamped names sort naturally).
+all_rollouts() {
+  [ -d "$CODEX_HOME/sessions" ] || return 0
+  find "$CODEX_HOME/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r
+}
+
+# rollout_for_id UUID -> path of that session's rollout, or nothing.
+rollout_for_id() {
+  all_rollouts | grep -i -- "-${1}\.jsonl\$" | head -n 1 || true
+}
+
+# rollout_for_dir DIR -> newest user-started rollout whose session_meta cwd is DIR, or nothing.
+# Codex's automatic reviewer runs as its own thread (thread_source "guardian_review") in the same cwd;
+# those are skipped so --last means the same session `resume --last` would pick.
+rollout_for_dir() {
+  local want f meta src
+  want="$(norm_path "$1")"
+  while IFS= read -r f; do
+    meta="$(head -n 1 "$f")"
+    src="$(jget "$meta" thread_source)"
+    [ -z "$src" ] || [ "$src" = user ] || continue
+    [ "$(norm_path "$(jget "$meta" cwd)")" = "$want" ] && { printf '%s' "$f"; return 0; }
+  done < <(all_rollouts)
+  return 0
+}
+
+# last_token_count FILE -> the last token_count event line in FILE, or nothing.
+last_token_count() {
+  [ -f "${1-}" ] || return 0
+  grep '"type":"token_count"' "$1" 2>/dev/null | tail -n 1 || true
+}
+
+# newest_usage -> "FILE" of the newest rollout that has a token_count event, or nothing.
+newest_usage() {
+  local f
+  while IFS= read -r f; do
+    grep -q '"type":"token_count"' "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
+  done < <(all_rollouts)
+  return 0
+}
+
+# session_id_of FILE -> the UUID in the rollout's file name.
+session_id_of() { printf '%s' "$1" | sed -n 's/.*-\([0-9a-fA-F-]\{36\}\)\.jsonl$/\1/p'; }
+
+# config_value KEY -> top-level KEY from $CODEX_HOME/config.toml (stops at the first [section]); "(default)" if unset.
+config_value() {
+  local v=""
+  if [ -f "$CODEX_HOME/config.toml" ]; then
+    v="$(awk -v k="$1" '
+      /^[[:space:]]*\[/ { exit }
+      $1 == k && $2 == "=" { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^"|"[[:space:]]*(#.*)?$/, ""); print; exit }
+    ' "$CODEX_HOME/config.toml")"
+  fi
+  printf '%s' "${v:-(default)}"
+}
+
+print_limits() {   # print_limits TOKEN_COUNT_LINE SESSION_ID
+  local line="$1" sid="$2" rl p sec plan
+  rl="$(printf '%s' "$line" | sed -n 's/.*"rate_limits":{\(.*\)}}$/\1/p')"
+  p="$(printf '%s' "$rl" | sed -n 's/.*"primary":{\([^}]*\)}.*/\1/p')"
+  sec="$(printf '%s' "$rl" | sed -n 's/.*"secondary":{\([^}]*\)}.*/\1/p')"
+  plan="$(jget "$rl" plan_type)"
+  printf 'limits:  plan=%s' "${plan:-unknown}"
+  local part
+  for part in "$p" "$sec"; do
+    [ -n "$part" ] || continue
+    printf '  %s %s%% used (resets %s)' \
+      "$(fmt_window "$(jget "$part" window_minutes)")" "$(fmt_pct "$(jget "$part" used_percent)")" \
+      "$(fmt_time "@$(jget "$part" resets_at)")"
+  done
+  printf '\n         as of %s, session %s\n' "$(fmt_time "$(jget "$line" timestamp)")" "$sid"
+}
+
+print_session() {   # print_session ROLLOUT_FILE
+  local f="$1" meta ctx usage tu
+  meta="$(head -n 1 "$f")"
+  ctx="$(grep '"type":"turn_context"' "$f" 2>/dev/null | tail -n 1 || true)"
+  echo
+  echo "session $(session_id_of "$f")   $(fmt_time "$(jget "$meta" timestamp)")   cwd=$(jget "$meta" cwd | sed 's/\\\\/\\/g')"
+  if [ -n "$ctx" ]; then
+    echo "  model=$(jget "$ctx" model)  effort=$(jget "$ctx" effort)  sandbox=$(jget "$(printf '%s' "$ctx" | sed -n 's/.*"sandbox_policy":{\([^}]*\)}.*/\1/p')" type)  approval=$(jget "$ctx" approval_policy)"
+  fi
+  usage="$(last_token_count "$f")"
+  if [ -n "$usage" ]; then
+    tu="$(printf '%s' "$usage" | sed -n 's/.*"total_token_usage":{\([^}]*\)}.*/\1/p')"
+    echo "  tokens: total $(jget "$tu" total_tokens) = input $(jget "$tu" input_tokens) (cached $(jget "$tu" cached_input_tokens)) + output $(jget "$tu" output_tokens)   context window $(jget "$usage" model_context_window)"
+  else
+    echo "  tokens: (no usage recorded)"
+  fi
+}
+
+run_status() {
+  CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  local ver login
+  ver="$(codex --version </dev/null 2>/dev/null || echo unknown)"
+  login="$(codex login status </dev/null 2>&1 | head -n 1 || true)"
+  echo "[codex status]"
+  echo "codex:   $ver  ($(command -v codex))   login: ${login:-unknown}"
+  echo "config:  model=$(config_value model)  effort=$(config_value model_reasoning_effort)  approvals_reviewer=$(config_value approvals_reviewer)   ($CODEX_HOME/config.toml)"
+  set_platform_args
+  local plat="none"
+  [ "${#PLATFORM_ARGS[@]}" -eq 0 ] || plat="${PLATFORM_ARGS[1]}"
+  echo "wrapper: $plat | read-only modes: approval_policy=never | delegate: --approve-for-me"
+
+  local target="" usage_file="" usage_line=""
+  if [ -n "$SESSION_ID" ]; then
+    target="$(rollout_for_id "$SESSION_ID")"
+    [ -n "$target" ] || die "session not found: $SESSION_ID (looked under $CODEX_HOME/sessions)"
+  elif [ "$RESUME_LAST" -eq 1 ]; then
+    target="$(rollout_for_dir "$(pwd -W 2>/dev/null || pwd)")"
+    [ -n "$target" ] || die "no session found for $DIR (looked under $CODEX_HOME/sessions)"
+  fi
+
+  if [ -n "$target" ]; then usage_line="$(last_token_count "$target")"; usage_file="$target"; fi
+  if [ -z "$usage_line" ]; then
+    usage_file="$(newest_usage)"
+    [ -z "$usage_file" ] || usage_line="$(last_token_count "$usage_file")"
+  fi
+  if [ -n "$usage_line" ]; then
+    print_limits "$usage_line" "$(session_id_of "$usage_file")"
+  else
+    echo "limits:  (no usage recorded yet)"
+  fi
+
+  [ -z "$target" ] || print_session "$target"
+}
+
 cleanup() {
   if { [ "${KEEP_LOG:-0}" = 1 ] || [ "${CODEX_RUN_KEEP_LOG:-0}" = 1 ]; } && [ -s "$LOG" ]; then
     echo "codex-run: events log kept at $LOG" >&2
@@ -259,11 +437,10 @@ main() {
   command -v codex >/dev/null 2>&1 || { echo "codex-run: 'codex' not found on PATH (npm i -g @openai/codex)" >&2; exit 2; }
 
   [ -d "$DIR" ] || die "directory not found: $DIR"
-  if [ "$MODE" != review ]; then
-    resolve_prompt "$PROMPT_ARG"
-  fi
+  case "$MODE" in review|status) ;; *) resolve_prompt "$PROMPT_ARG" ;; esac
   unset CDPATH
   cd -- "$DIR"
+  if [ "$MODE" = status ]; then run_status; return; fi
 
   local tmproot="${TMPDIR:-/tmp}/codex-run"
   mkdir -p "$tmproot"

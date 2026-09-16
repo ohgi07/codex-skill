@@ -302,6 +302,96 @@ assert_eq "Windows (cygwin) + CODEX_RUN_WINDOWS_SANDBOX=elevated" "$p" '-c windo
 assert_eq "CODEX_RUN_WINDOWS_SANDBOX=disabled -> rejected" "$rc" 1
 assert_contains "CODEX_RUN_WINDOWS_SANDBOX=disabled -> message" "$(cat "$WORK/plat.err")" "CODEX_RUN_WINDOWS_SANDBOX"
 
+# ---------------------------------------------------------------- status
+# Fixture CODEX_HOME shaped like the real one (Codex 0.154.0 rollout files): session_meta on line 1,
+# a turn_context line, and (for sessions that completed a turn) a token_count event with rate limits.
+CH="$WORK/codex-home"; rm -rf "$CH"; mkdir -p "$CH/sessions/2026/09/15" "$CH/sessions/2026/09/16"
+printf '%s\n' 'model = "cfg-model"' 'model_reasoning_effort = "high"' 'approvals_reviewer = "auto_review"' \
+  '[projects."x"]' 'model = "not-this-one"' > "$CH/config.toml"
+SID_A="aaaaaaaa-0000-4000-8000-00000000000a"   # in REPO, has usage, newest in REPO
+SID_B="bbbbbbbb-0000-4000-8000-00000000000b"   # elsewhere, has usage, newest overall
+SID_C="cccccccc-0000-4000-8000-00000000000c"   # in REPO, failed before any usage
+REPO_JSON="$(cd "$REPO" && (pwd -W 2>/dev/null || pwd) | sed 's#/#\\\\#g')"   # C:\\Users\\... as in the JSON
+SID_G="99999999-0000-4000-8000-000000000099"   # in REPO, newest, but a guardian_review thread (auto reviewer)
+mk_rollout() { # file id cwd_json model sandbox approval [usage_line] ; MK_SOURCE overrides thread_source
+  { printf '{"timestamp":"2026-09-16T10:03:27.663Z","ordinal":0,"type":"session_meta","payload":{"session_id":"%s","id":"%s","timestamp":"2026-09-16T10:03:27.485Z","cwd":"%s","originator":"codex_exec","cli_version":"0.154.0","source":"exec","thread_source":"%s"}}\n' "$2" "$2" "$3" "${MK_SOURCE:-user}"
+    printf '{"timestamp":"2026-09-16T10:03:29.636Z","ordinal":5,"type":"turn_context","payload":{"turn_id":"t","cwd":"%s","approval_policy":"%s","sandbox_policy":{"type":"%s"},"model":"%s","effort":"medium","summary":"auto"}}\n' "$3" "$6" "$5" "$4"
+    [ -z "${7-}" ] || printf '%s\n' "$7"
+  } > "$1"
+}
+usage_json() { # total input cached output pct5h pctweek plan
+  printf '{"timestamp":"2026-09-16T10:03:25.926Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%s,"cached_input_tokens":%s,"cache_write_input_tokens":0,"output_tokens":%s,"reasoning_output_tokens":0,"total_tokens":%s},"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":%s,"window_minutes":300,"resets_at":1789568043},"secondary":{"used_percent":%s,"window_minutes":10080,"resets_at":1790088680},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"%s","rate_limit_reached_type":null}}}' "$2" "$3" "$4" "$1" "$5" "$6" "$7"
+}
+mk_rollout "$CH/sessions/2026/09/15/rollout-2026-09-15T09-00-00-$SID_C.jsonl" "$SID_C" "$REPO_JSON" "bad-model" "read-only" "never"
+mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-00-00-$SID_A.jsonl" "$SID_A" "$REPO_JSON" "model-a" "workspace-write" "on-request" \
+  "$(usage_json 24786 24539 11776 247 19.0 34.0 plus)"
+mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T11-00-00-$SID_B.jsonl" "$SID_B" 'D:\\elsewhere' "model-b" "read-only" "never" \
+  "$(usage_json 500 400 0 100 77.5 88.0 pro)"
+MK_SOURCE=guardian_review mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-30-00-$SID_G.jsonl" "$SID_G" "$REPO_JSON" "codex-auto-review" "read-only" "never"
+export CODEX_HOME="$CH"
+
+reset_fake; run_wrapper status
+assert_eq "status -> rc 0" "$RC" 0
+assert_eq "status -> codex only asked for version/login" "$(args_str)" "login status "
+assert_contains "status -> header" "$OUT" "[codex status]"
+assert_contains "status -> codex version" "$OUT" "codex:   fake-codex 9.9.9"
+assert_contains "status -> login" "$OUT" "login: Logged in using Fake"
+assert_contains "status -> config model/effort/reviewer from top-level keys" "$OUT" "config:  model=cfg-model  effort=high  approvals_reviewer=auto_review"
+assert_not_contains "status -> ignores [projects] section" "$OUT" "not-this-one"
+assert_contains "status -> wrapper policy line" "$OUT" "read-only modes: approval_policy=never | delegate: --approve-for-me"
+assert_contains "status -> limits from newest session overall (B)" "$OUT" "limits:  plan=pro  5h window 77.5% used"
+assert_contains "status -> weekly window" "$OUT" "weekly 88% used"
+assert_contains "status -> limits source noted" "$OUT" "session $SID_B"
+assert_not_contains "status without session -> no session block" "$OUT" "tokens:"
+
+reset_fake; run_wrapper status -C "$REPO" --last
+assert_eq "status --last -> rc 0" "$RC" 0
+assert_contains "status --last -> newest session in DIR, not overall" "$OUT" "session $SID_A"
+assert_not_contains "status --last -> skips other dirs" "$OUT" "$SID_B"
+assert_not_contains "status --last -> skips the auto-reviewer's guardian_review thread" "$OUT" "$SID_G"
+assert_contains "status --last -> effective model/sandbox/approval" "$OUT" "model=model-a  effort=medium  sandbox=workspace-write  approval=on-request"
+assert_contains "status --last -> token totals" "$OUT" "tokens: total 24786 = input 24539 (cached 11776) + output 247   context window 258400"
+assert_contains "status --last -> limits from that session" "$OUT" "limits:  plan=plus  5h window 19% used"
+
+reset_fake; run_wrapper status "$SID_G"
+assert_contains "status SESSION_ID -> explicit id still finds a guardian_review thread" "$OUT" "session $SID_G"
+
+reset_fake; run_wrapper status "$SID_C"
+assert_eq "status SESSION_ID -> rc 0" "$RC" 0
+assert_contains "status SESSION_ID -> session block" "$OUT" "session $SID_C"
+assert_contains "status SESSION_ID without usage -> says so" "$OUT" "tokens: (no usage recorded)"
+assert_contains "status SESSION_ID without usage -> limits fall back to newest overall" "$OUT" "limits:  plan=pro"
+
+reset_fake; run_wrapper status "${SID_A^^}"
+assert_contains "status SESSION_ID -> case-insensitive lookup" "$OUT" "session $SID_A"
+
+reset_fake; run_wrapper status "dddddddd-0000-4000-8000-00000000000d"
+assert_eq "status unknown SESSION_ID -> rc 1" "$RC" 1
+assert_contains "status unknown SESSION_ID -> message" "$ERR" "session not found"
+
+reset_fake; run_wrapper status not-a-uuid
+assert_eq "status non-UUID -> rc 1" "$RC" 1
+assert_contains "status non-UUID -> message" "$ERR" "SESSION_ID must be the UUID"
+
+reset_fake; run_wrapper status --last "$SID_A"
+assert_eq "status --last + SESSION_ID -> rc 1" "$RC" 1
+assert_contains "status --last + SESSION_ID -> message" "$ERR" "not both"
+
+EMPTY="$WORK/empty-dir"; mkdir -p "$EMPTY"
+reset_fake; run_wrapper status -C "$EMPTY" --last
+assert_eq "status --last with no session for DIR -> rc 1" "$RC" 1
+assert_contains "status --last with no session for DIR -> message" "$ERR" "no session found for"
+
+reset_fake; run_wrapper status -m x
+assert_eq "status -m -> rc 1" "$RC" 1
+assert_contains "status -m -> message" "$ERR" "not valid for status"
+
+reset_fake; CODEX_HOME="$WORK/no-such-home" run_wrapper status
+assert_eq "status with no sessions dir -> rc 0" "$RC" 0
+assert_contains "status with no sessions dir -> limits unknown" "$OUT" "limits:  (no usage recorded yet)"
+assert_contains "status with no config -> defaults" "$OUT" "config:  model=(default)  effort=(default)  approvals_reviewer=(default)"
+unset CODEX_HOME
+
 # ---------------------------------------------------------------- SKILL.md
 SKILL="$HERE/../SKILL.md"
 [ -f "$SKILL" ] && ok "SKILL.md exists" || fail "SKILL.md exists"
@@ -313,6 +403,7 @@ done
 assert_contains "SKILL.md mentions git diff rule" "$(cat "$SKILL" 2>/dev/null)" "git diff"
 assert_contains "SKILL.md mentions timeout" "$(cat "$SKILL" 2>/dev/null)" "600000"
 assert_contains "SKILL.md mentions resume default read-only" "$(cat "$SKILL" 2>/dev/null)" "--mode workspace-write"
+assert_contains "SKILL.md documents status mode" "$(cat "$SKILL" 2>/dev/null)" '`status`'
 [ -f "$HERE/../DESIGN.md" ] && ok "DESIGN.md exists" || fail "DESIGN.md exists"
 
 # ---------------------------------------------------------------- summary

@@ -10,6 +10,12 @@ if [ ! -t 0 ] && [ -n "${FAKE_CODEX_STDIN:-}" ]; then
   cat > "$FAKE_CODEX_STDIN"
 fi
 
+# Non-exec subcommands used by `status`.
+case "${1-} ${2-}" in
+  "--version ")     echo "fake-codex 9.9.9"; exit 0 ;;
+  "login status")   echo "${FAKE_CODEX_LOGIN:-Logged in using Fake}"; exit 0 ;;
+esac
+
 # Locate the file after `-o`, if any, and write the canned final message there.
 out=""
 prev=""

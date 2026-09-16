@@ -46,6 +46,7 @@ codex-run.sh review   [-C DIR] [-m MODEL] [--effort X] [--uncommitted | --base B
 codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+codex-run.sh status   [-C DIR] [--last | SESSION_ID]
 ```
 
 - `SESSION_ID` must be the UUID printed on the `session:` line; anything else
@@ -80,6 +81,7 @@ codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--
 | `ask` | `codex exec -s read-only RO PLAT --color never --json -o OUT --skip-git-repo-check -` | read-only |
 | `delegate` | `codex exec --approve-for-me PLAT --color never --json -o OUT --skip-git-repo-check -` | workspace-write; approval requests are routed through Codex automatic review, subject to the effective policy/config. **No explicit `-s`**: in 0.154.0 `--approve-for-me` is mutually exclusive with `--sandbox` (verified: `error: the argument '--sandbox <SANDBOX_MODE>' cannot be used with '--approve-for-me'`) and already selects the workspace-write sandbox. |
 | `resume` | `codex exec resume (--last \| ID) POLICY PLAT --json -o OUT --skip-git-repo-check -` | resumes conversation context; execution permissions are resolved from **this** invocation, default `read-only` |
+| `status` | `codex --version`, `codex login status`; otherwise reads `$CODEX_HOME/config.toml` and `$CODEX_HOME/sessions/**/rollout-*-<id>.jsonl` (verified layout, 0.154.0: `session_meta` line 1 with `cwd`/`thread_source`; `turn_context` with effective `model`/`effort`/`sandbox_policy`/`approval_policy`; `token_count` events with `total_token_usage` and `rate_limits`) | no `codex exec`, no API call, no sandbox needed. Header (version, login, config model/effort/reviewer, wrapper policy, rate limits from the newest `token_count`) plus, with `--last` (newest `thread_source: user` session whose cwd is DIR — the auto reviewer's `guardian_review` threads are skipped) or SESSION_ID, that session's model/sandbox/approval and token totals |
 
 Where:
 

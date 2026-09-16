@@ -19,6 +19,7 @@ Wrapper script (bash — run it with the Bash tool):
 | `ask` | second opinion, explanation, design critique, free-form review | read-only | Codex can read the repo but cannot write. |
 | `delegate` | user asks Codex to implement / modify something | workspace-write | approvals go through Codex automatic review. |
 | `resume` | follow-up on a previous Codex session | `--mode read-only` (default) or `--mode workspace-write` | `--last`, or the UUID from the `session:` line (nothing else is accepted). |
+| `status` | user asks about Codex's current setup, model, login, rate-limit / token usage, or what a session ran with | none (offline; reads `~/.codex`, no API call) | header only, or add `--last` (newest session in `-C DIR`) / SESSION_ID for that session's model, sandbox, approval and token totals. Not for `-m` / `--effort`. |
 
 Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|…` (passthrough to Codex's `model_reasoning_effort`).
 
@@ -75,6 +76,11 @@ Add input validation to POST /users in src/routes/users.ts. Reject empty names. 
 EOF
 ```
 then `git -C "D:/Code Projects/x" diff` and read it before reporting.
+
+Codex setup and remaining rate limit, plus what the last session in this repo used:
+```bash
+~/.claude/skills/codex/scripts/codex-run.sh status -C "D:/Code Projects/x" --last
+```
 
 Follow-up on that session (read-only):
 ```bash

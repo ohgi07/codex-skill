@@ -109,6 +109,9 @@ t="$( ( source "$RUN"; extract_thread_id "$WORK/ev.jsonl" ) )"
 assert_eq "extract_thread_id" "$t" "019d-abc"
 t="$( ( source "$RUN"; extract_thread_id "$WORK/does-not-exist" ) )"
 assert_eq "extract_thread_id missing file -> empty" "$t" ""
+printf '{"type":"item.completed"}\n' > "$WORK/ev-none.jsonl"
+t="$( ( set -euo pipefail; source "$RUN"; extract_thread_id "$WORK/ev-none.jsonl"; echo "still-alive" ) )"
+assert_eq "extract_thread_id no thread.started under pipefail -> empty, no abort" "$t" "still-alive"
 
 # ---------------------------------------------------------------- summary
 echo

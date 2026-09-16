@@ -55,7 +55,7 @@ resolve_prompt() {
 # extract_thread_id FILE -> prints the thread_id from the first thread.started event, or nothing.
 extract_thread_id() {
   [ -f "${1-}" ] || return 0
-  grep '"type":"thread\.started"' "$1" 2>/dev/null | sed -n 's/.*"thread_id":"\([^"]*\)".*/\1/p' | head -n 1
+  grep '"type":"thread\.started"' "$1" 2>/dev/null | sed -n 's/.*"thread_id":"\([^"]*\)".*/\1/p' | head -n 1 || true
 }
 
 # parse_args "$@" -> sets MODE DIR MODEL EFFORT REVIEW_TARGET RESUME_LAST SESSION_ID RESUME_MODE PROMPT_ARG

@@ -178,7 +178,7 @@ rm -rf "$TMPDIR/codex-run"
 ! grep -q dangerously "$RUN" && ok "wrapper contains no dangerously-* flag" || fail "wrapper contains no dangerously-* flag"
 
 # ---------------------------------------------------------------- resume
-UUID_A="11111111-2222-3333-4444-555555555555"
+UUID_A="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"   # hex letters, so the case-insensitivity test is not vacuous
 UUID_B="99999999-8888-7777-6666-555555555555"
 
 reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
@@ -204,6 +204,10 @@ assert_contains "resume matching id -> session line" "$OUT" "session: $UUID_A"
 
 reset_fake; FAKE_CODEX_THREAD="$(tr 'a-f' 'A-F' <<< "$UUID_A")" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
 assert_eq "resume id case-insensitive match -> rc 0" "$RC" 0
+
+reset_fake; FAKE_CODEX_THREAD="" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
+assert_eq "resume explicit id but empty thread id -> no mismatch check, rc 0" "$RC" 0
+assert_not_contains "resume empty thread id -> no session line" "$OUT" "session:"
 
 reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
 assert_eq "resume mismatched id -> rc 1" "$RC" 1

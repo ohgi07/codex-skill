@@ -82,11 +82,11 @@ reset_fake; run_wrapper ask -C "$WORK/does-not-exist" "hi"
 assert_eq "-C missing dir -> rc 1" "$RC" 1
 assert_contains "-C missing dir -> message" "$ERR" "directory not found"
 
-reset_fake; : | run_wrapper ask
+reset_fake; run_wrapper ask </dev/null          # redirect, not a pipe: a pipe would subshell run_wrapper and lose RC/ERR
 assert_eq "ask empty stdin -> rc 1" "$RC" 1
 assert_contains "ask empty stdin -> message" "$ERR" "prompt is empty"
 
-reset_fake; printf '  \n\t\n' | run_wrapper ask
+reset_fake; run_wrapper ask <<< $'  \n\t'
 assert_eq "ask whitespace stdin -> rc 1" "$RC" 1
 
 reset_fake; run_wrapper ask "a" "b"

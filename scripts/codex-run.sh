@@ -196,6 +196,14 @@ run_json_mode() {
   return 0
 }
 
+# Executes CMD for review. Codex's stdout is passed through unchanged after the header.
+run_review() {
+  local rc=0
+  "${CMD[@]}" </dev/null 2>"$ERR_FILE" || rc=$?
+  if [ "$rc" -ne 0 ]; then report_failure "$rc"; return "$rc"; fi
+  return 0
+}
+
 cleanup() {
   if [ "${KEEP_LOG:-0}" = 1 ] || [ "${CODEX_RUN_KEEP_LOG:-0}" = 1 ]; then
     echo "codex-run: events log kept at $LOG" >&2
@@ -229,7 +237,7 @@ main() {
   build_cmd
   print_header
   if [ "$MODE" = review ]; then
-    echo "codex-run: review not implemented yet" >&2; exit 1
+    run_review
   else
     run_json_mode
   fi

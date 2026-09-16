@@ -222,6 +222,26 @@ assert_eq "resume by thread name -> no mismatch check, rc 0" "$RC" 0
 reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" --last "hi"
 assert_eq "resume --last -> no mismatch check" "$RC" 0
 
+# ---------------------------------------------------------------- review
+reset_fake; run_wrapper review -C "$REPO"
+assert_eq "review default -> rc 0" "$RC" 0
+assert_eq "review default -> argv" "$(args_str)" 'exec -s read-only --color never review --uncommitted -c sandbox_mode="read-only" '
+assert_contains "review -> header" "$OUT" "[codex review] cwd="
+assert_contains "review -> passthrough output" "$OUT" "fake review output"
+assert_not_contains "review -> no --json" "$(args_str)" "--json"
+assert_eq "review success -> no log left" "$(log_count)" 0
+
+reset_fake; run_wrapper review -C "$REPO" --base main
+assert_eq "review --base -> argv" "$(args_str)" 'exec -s read-only --color never review --base main -c sandbox_mode="read-only" '
+
+reset_fake; run_wrapper review -C "$REPO" --commit abc123 -m gpt-test --effort low
+assert_eq "review --commit -m --effort -> argv" "$(args_str)" 'exec -s read-only --color never review --commit abc123 -c sandbox_mode="read-only" -c model_reasoning_effort="low" -m gpt-test '
+
+reset_fake; FAKE_CODEX_RC=2 run_wrapper review -C "$REPO"
+assert_eq "review failure -> same rc" "$RC" 2
+assert_contains "review failure -> stderr tail" "$ERR" "fake error on stderr"
+rm -rf "$TMPDIR/codex-run"
+
 # ---------------------------------------------------------------- summary
 echo
 echo "passed=$PASS failed=$FAIL"

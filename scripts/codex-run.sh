@@ -10,7 +10,7 @@
 #   review/ask  -> -s read-only
 #   delegate    -> -s workspace-write --approve-for-me
 #   resume      -> -c sandbox_mode="<--mode>", default read-only
-# This script never passes any --dangerously-* flag.
+# This script never passes any flag that bypasses sandboxing or approvals.
 
 usage() {
   cat <<'USAGE'
@@ -129,16 +129,100 @@ parse_args() {
   esac
 }
 
+# build_cmd -> sets CMD (array). Uses MODE MODEL EFFORT REVIEW_TARGET RESUME_LAST SESSION_ID RESUME_MODE OUT_FILE.
+build_cmd() {
+  CFG_ARGS=(); MODEL_ARGS=()
+  [ -z "$EFFORT" ] || CFG_ARGS+=(-c "model_reasoning_effort=\"$EFFORT\"")
+  [ -z "$MODEL" ]  || MODEL_ARGS+=(-m "$MODEL")
+
+  case "$MODE" in
+    review)
+      # -s goes on `exec` (review has no -s); -c sandbox_mode is added on `review` too so the
+      # read-only guarantee does not depend on how the parent flag propagates.
+      CMD=(codex exec -s read-only --color never review "${REVIEW_TARGET[@]}" -c 'sandbox_mode="read-only"' "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}") ;;
+    ask)
+      CMD=(codex exec -s read-only --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+    delegate)
+      CMD=(codex exec -s workspace-write --approve-for-me --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+    resume)
+      local -a target
+      if [ "$RESUME_LAST" -eq 1 ]; then target=(--last); else target=("$SESSION_ID"); fi
+      CMD=(codex exec resume "${target[@]}" --skip-git-repo-check --json -o "$OUT_FILE" -c "sandbox_mode=\"$RESUME_MODE\"" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+  esac
+}
+
+print_header() {
+  local cwd; cwd="$(pwd -W 2>/dev/null || pwd)"
+  echo "[codex $MODE] cwd=$cwd model=${MODEL:-default}"
+}
+
+# Prints the last 20 lines of codex's stderr plus any error events from the JSONL.
+report_failure() {
+  local rc="$1"
+  KEEP_LOG=1
+  echo "codex-run: codex exited with status $rc" >&2
+  [ -s "$ERR_FILE" ] && tail -n 20 "$ERR_FILE" >&2
+  grep -E '"type":"(error|turn\.failed)"' "$LOG" 2>/dev/null | tail -n 5 >&2 || true
+  if [ -s "$OUT_FILE" ]; then
+    echo; echo "--- partial output ---"; cat "$OUT_FILE"; echo
+  fi
+}
+
+# Executes CMD for ask/delegate/resume. Prompt from $PROMPT on stdin. Returns codex's exit code.
+run_json_mode() {
+  local rc=0
+  printf '%s' "$PROMPT" | "${CMD[@]}" >"$LOG" 2>"$ERR_FILE" || rc=$?
+  if [ "$rc" -ne 0 ]; then report_failure "$rc"; return "$rc"; fi
+
+  local tid; tid="$(extract_thread_id "$LOG")"
+  [ -z "$tid" ] || echo "session: $tid"
+  echo
+  if [ -s "$OUT_FILE" ]; then cat "$OUT_FILE"; echo; fi
+
+  if { [ "$MODE" = delegate ] || { [ "$MODE" = resume ] && [ "$RESUME_MODE" = workspace-write ]; }; } \
+     && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo; echo "--- git status after Codex ---"; git status --short
+  fi
+  return 0
+}
+
+cleanup() {
+  if [ "${KEEP_LOG:-0}" = 1 ] || [ "${CODEX_RUN_KEEP_LOG:-0}" = 1 ]; then
+    echo "codex-run: events log kept at $LOG" >&2
+  else
+    rm -f "$LOG"
+  fi
+  rm -f "$OUT_FILE" "$ERR_FILE"
+}
+
 main() {
   set -euo pipefail
   umask 077
+
+  command -v codex >/dev/null 2>&1 || { echo "codex-run: 'codex' not found on PATH (npm i -g @openai/codex)" >&2; exit 2; }
 
   parse_args "$@"
   [ -d "$DIR" ] || die "directory not found: $DIR"
   if [ "$MODE" != review ]; then
     resolve_prompt "$PROMPT_ARG"
   fi
-  echo "parsed: mode=$MODE dir=$DIR"
+  cd "$DIR"
+
+  local tmproot="${TMPDIR:-/tmp}/codex-run"
+  mkdir -p "$tmproot"
+  LOG="$(mktemp "$tmproot/events.XXXXXX")"
+  OUT_FILE="$(mktemp "$tmproot/last.XXXXXX")"
+  ERR_FILE="$(mktemp "$tmproot/stderr.XXXXXX")"
+  KEEP_LOG=0
+  trap cleanup EXIT
+
+  build_cmd
+  print_header
+  if [ "$MODE" = review ]; then
+    echo "codex-run: review not implemented yet" >&2; exit 1
+  else
+    run_json_mode
+  fi
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

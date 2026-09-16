@@ -113,6 +113,70 @@ printf '{"type":"item.completed"}\n' > "$WORK/ev-none.jsonl"
 t="$( ( set -euo pipefail; source "$RUN"; extract_thread_id "$WORK/ev-none.jsonl"; echo "still-alive" ) )"
 assert_eq "extract_thread_id no thread.started under pipefail -> empty, no abort" "$t" "still-alive"
 
+# ---------------------------------------------------------------- ask
+reset_fake; run_wrapper ask -C "$WORK" "what is this"
+assert_eq "ask -> rc 0" "$RC" 0
+assert_contains "ask -> argv" "$(args_str)" "exec -s read-only --color never --skip-git-repo-check --json -o "
+assert_eq "ask -> prompt via stdin '-'" "$(tail -n 1 "$FAKE_CODEX_ARGS")" "-"
+assert_eq "ask -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "what is this"
+assert_contains "ask -> header" "$OUT" "[codex ask] cwd="
+assert_contains "ask -> header model default" "$OUT" "model=default"
+assert_contains "ask -> session line" "$OUT" "session: fake-thread-1"
+assert_contains "ask -> final message" "$OUT" "fake answer"
+assert_not_contains "ask -> no trailer" "$OUT" "--- git status after Codex ---"
+assert_not_contains "ask -> never workspace-write" "$(args_str)" "workspace-write"
+assert_eq "ask success -> no log left" "$(log_count)" 0
+
+reset_fake; run_wrapper ask -C "$WORK" <<'EOF'
+line one
+line two
+EOF
+assert_eq "ask heredoc -> rc 0" "$RC" 0
+assert_eq "ask heredoc -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" $'line one\nline two'   # $(...) strips the trailing newline
+
+reset_fake; run_wrapper ask -C "$WORK" -m gpt-test --effort high "q"
+assert_contains "ask -m -> argv" "$(args_str)" " -m gpt-test "
+assert_contains "ask --effort -> argv" "$(args_str)" ' -c model_reasoning_effort="high" '
+assert_contains "ask -m -> header" "$OUT" "model=gpt-test"
+
+reset_fake; FAKE_CODEX_THREAD="" run_wrapper ask -C "$WORK" "q"
+assert_eq "ask empty thread id -> rc 0" "$RC" 0
+assert_not_contains "ask empty thread id -> no session line" "$OUT" "session:"
+
+# ---------------------------------------------------------------- delegate
+REPO="$WORK/repo"; rm -rf "$REPO"; mkdir -p "$REPO"
+git -C "$REPO" init -q && git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+reset_fake; FAKE_CODEX_TOUCH="$REPO/new.txt" run_wrapper delegate -C "$REPO" "make a file"
+assert_eq "delegate -> rc 0" "$RC" 0
+assert_contains "delegate -> argv" "$(args_str)" "exec -s workspace-write --approve-for-me --color never --skip-git-repo-check --json -o "
+assert_contains "delegate -> header" "$OUT" "[codex delegate] cwd="
+assert_contains "delegate -> trailer" "$OUT" "--- git status after Codex ---"
+assert_contains "delegate -> trailer lists file" "$OUT" "?? new.txt"
+
+NOGIT="$(mktemp -d /tmp/codex-nogit.XXXXXX)"   # outside the skill's own git repo, so rev-parse really fails
+reset_fake; run_wrapper delegate -C "$NOGIT" "x"
+assert_eq "delegate nogit -> rc 0" "$RC" 0
+assert_not_contains "delegate nogit -> no trailer" "$OUT" "--- git status after Codex ---"
+rm -rf "$NOGIT"
+
+# ---------------------------------------------------------------- failure / log retention
+reset_fake; FAKE_CODEX_RC=3 run_wrapper ask -C "$WORK" "q"
+assert_eq "codex failure -> same rc" "$RC" 3
+assert_contains "codex failure -> stderr tail shown" "$ERR" "fake error on stderr"
+assert_contains "codex failure -> log kept message" "$ERR" "events log kept at "
+kept="$(sed -n 's/.*events log kept at \(.*\)$/\1/p' <<< "$ERR" | head -n 1)"
+[ -n "$kept" ] && [ -f "$kept" ] && ok "codex failure -> log file exists" || fail "codex failure -> log file exists" "path=[$kept]"
+assert_contains "codex failure -> partial output shown" "$OUT" "fake answer"
+rm -rf "$TMPDIR/codex-run"
+
+reset_fake; CODEX_RUN_KEEP_LOG=1 run_wrapper ask -C "$WORK" "q"
+assert_eq "KEEP_LOG success -> rc 0" "$RC" 0
+assert_contains "KEEP_LOG -> path printed" "$ERR" "events log kept at "
+assert_eq "KEEP_LOG -> one log left" "$(log_count)" 1
+rm -rf "$TMPDIR/codex-run"
+
+! grep -q dangerously "$RUN" && ok "wrapper contains no dangerously-* flag" || fail "wrapper contains no dangerously-* flag"
+
 # ---------------------------------------------------------------- summary
 echo
 echo "passed=$PASS failed=$FAIL"

@@ -29,7 +29,12 @@ Follow-up turns on a prior Codex session are supported via `resume`.
 ~/.claude/skills/codex/
 ├── SKILL.md              # when/how Claude uses it
 ├── scripts/codex-run.sh  # the wrapper (bash, Git Bash compatible)
-└── DESIGN.md             # copy of this spec, kept next to the skill
+├── DESIGN.md              # copy of this spec, kept next to the skill
+├── tests/fake-codex       # test double for the `codex` CLI, used by test-unit.sh
+├── tests/test-unit.sh     # offline unit harness (no network; fake-codex on PATH)
+├── tests/test-smoke.sh    # hits the real Codex API on the user's account; not run in CI
+├── .gitattributes         # forces LF line endings for the shell scripts on Windows
+└── .gitignore             # excludes tests/.work and other per-run scratch (git-ignored)
 ```
 
 User-level install so it works in every project.
@@ -40,9 +45,13 @@ User-level install so it works in every project.
 codex-run.sh review   [-C DIR] [-m MODEL] [--effort X] [--uncommitted | --base BRANCH | --commit SHA]
 codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
-codex-run.sh resume   [-C DIR] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
 ```
 
+- `SESSION_ID` must be the UUID printed on the `session:` line; anything else
+  (empty, thread names, values starting with `-`) is a usage error before
+  codex is invoked. There is no `--` passthrough; a prompt that starts with
+  `-` must be given on stdin.
 - `PROMPT` is the last positional argument. Resolution rules:
   - PROMPT given → use it.
   - PROMPT is `-`, or omitted while stdin is piped → read stdin
@@ -67,9 +76,9 @@ codex-run.sh resume   [-C DIR] (--last | SESSION_ID) [--mode read-only|workspace
 
 | mode | command | permissions |
 |---|---|---|
-| `review` | `codex exec -s read-only --color never review <target> -c sandbox_mode="read-only" RO PLAT` — default target `--uncommitted` | read-only, enforced by the wrapper (not assumed from the reviewer). `-s` lives on `exec` (the `review` subcommand has no `-s`); the `-c sandbox_mode` override is added on `review` as well so the guarantee does not depend on how the parent flag propagates. |
-| `ask` | `codex exec -s read-only RO PLAT --json -o OUT --skip-git-repo-check -` | read-only |
-| `delegate` | `codex exec --approve-for-me PLAT --json -o OUT --skip-git-repo-check -` | workspace-write; approval requests are routed through Codex automatic review, subject to the effective policy/config. **No explicit `-s`**: in 0.154.0 `--approve-for-me` is mutually exclusive with `--sandbox` (verified: `error: the argument '--sandbox <SANDBOX_MODE>' cannot be used with '--approve-for-me'`) and already selects the workspace-write sandbox. |
+| `review` | `codex exec -s read-only --color never review <target> -c sandbox_mode="read-only" RO PLAT` — default target `--uncommitted` | read-only, enforced by the wrapper (not assumed from the reviewer). `-s` lives on `exec` (the `review` subcommand has no `-s`); the `-c sandbox_mode` override is added on `review` as well so the guarantee does not depend on how the parent flag propagates. `-m` and `-c` are also accepted by the `review` subcommand itself (verified via `codex exec review --help`). |
+| `ask` | `codex exec -s read-only RO PLAT --color never --json -o OUT --skip-git-repo-check -` | read-only |
+| `delegate` | `codex exec --approve-for-me PLAT --color never --json -o OUT --skip-git-repo-check -` | workspace-write; approval requests are routed through Codex automatic review, subject to the effective policy/config. **No explicit `-s`**: in 0.154.0 `--approve-for-me` is mutually exclusive with `--sandbox` (verified: `error: the argument '--sandbox <SANDBOX_MODE>' cannot be used with '--approve-for-me'`) and already selects the workspace-write sandbox. |
 | `resume` | `codex exec resume (--last \| ID) POLICY PLAT --json -o OUT --skip-git-repo-check -` | resumes conversation context; execution permissions are resolved from **this** invocation, default `read-only` |
 
 Where:
@@ -97,8 +106,13 @@ so `ask → resume` can never silently gain write access.
 (Resolved during the smoke test: the approval keys 0.154.0 honours are
 `approval_policy` and `approvals_reviewer`; see the mode table above.)
 
-The wrapper exposes no way to pass `--dangerously-bypass-approvals-and-sandbox`
-or `--dangerously-bypass-hook-trust`.
+The wrapper never emits `--dangerously-bypass-approvals-and-sandbox` or
+`--dangerously-bypass-hook-trust`, and no caller-supplied value can reach argv
+as a flag: positionals are validated (SESSION_ID must be a UUID, `review`
+takes none), option values may not start with `-`, there is no `--`
+passthrough, and the prompt travels on stdin. (`codex exec resume` does
+accept the bypass flag if handed one — verified — which is why the
+positional validation matters.)
 
 Sandbox invariants the wrapper guarantees on its own, without relying on Codex
 subcommand defaults or the user's config.toml: `review` and `ask` always carry
@@ -109,10 +123,18 @@ every mode carries `-c windows.sandbox=...`; only `delegate` and
 
 ### Resume session verification
 
-Codex has been observed to start a fresh thread when given a non-existent or
-malformed session id instead of failing. To prevent a silent "resume" that is
-actually a new session, an explicit-`SESSION_ID` resume compares the requested
-id with the `thread_id` in the `thread.started` event of the JSONL stream:
+`SESSION_ID` is validated as a UUID by the wrapper, in `parse_args`, before
+codex is ever invoked (see "Script interface" above): an empty string, a
+thread name, or any other non-UUID value is a usage error, exit 1. This
+replaces the earlier design where a non-UUID id (or an empty one) was passed
+straight through to codex and only caught later, if at all, by the
+`thread_id` comparison below — that comparison now only ever compares two
+UUIDs.
+
+Codex has been observed to start a fresh thread when given a non-existent
+session id instead of failing. To prevent a silent "resume" that is actually
+a new session, an explicit-`SESSION_ID` resume compares the requested id with
+the `thread_id` in the `thread.started` event of the JSONL stream:
 
 ```
 requested SESSION_ID = A
@@ -120,7 +142,15 @@ thread.started.thread_id = B
 A != B  →  stderr error, exit 1, keep JSONL
 ```
 
-`--last` is excluded from this check (the expected id is not known in advance).
+If the JSONL stream has no `thread.started` event at all (empty `thread_id`),
+the comparison cannot run: the wrapper prints a warning to stderr
+(`could not verify that session ... was resumed`) but does not fail the call,
+since the underlying run may still have succeeded.
+
+`--last` is excluded from this check (the expected id is not known in
+advance); passing `--last` together with a SESSION_ID-shaped positional
+argument is itself a usage error (exit 1, "not both") rather than silently
+picking one.
 
 ### No `jq` dependency
 
@@ -172,11 +202,16 @@ output; it should not accumulate silently.
 | no mode / unknown mode | usage, exit 1 |
 | `review` with more than one of `--uncommitted/--base/--commit`, or a PROMPT | usage, exit 1 |
 | `resume` without `--last` or SESSION_ID, or `--mode` outside the two values | usage, exit 1 |
+| `resume SESSION_ID` not a UUID (empty, thread name, or otherwise malformed) | usage, exit 1, codex never invoked |
+| `resume --last` together with a UUID-shaped positional argument | usage, exit 1 ("pass either --last or SESSION_ID, not both") |
+| option value for `-C`/`-m`/`--effort`/`--base`/`--commit`/`--mode` starts with `-` | usage, exit 1 (reuses that option's "needs a ..." message), codex never invoked |
 | PROMPT omitted and stdin is a TTY (ask/delegate/resume) | usage, exit 1 |
 | empty or whitespace-only prompt for ask/delegate/resume | usage, exit 1 |
 | `-C DIR` missing | message, exit 1 (before invoking codex) |
 | codex exits non-zero | print last 20 lines of codex stderr, print partial `-o` content if present, exit with codex's code, keep JSONL |
+| `review` fails | same as above, except the (always-empty, since `review` writes no JSONL) events log is not kept |
 | `resume SESSION_ID` emitted a different `thread_id` | stderr error, exit 1, keep JSONL |
+| `resume SESSION_ID` given but no `thread.started` event in the stream | warning on stderr, exit code unchanged (cannot verify, does not fail the call) |
 
 ## SKILL.md contents
 

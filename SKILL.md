@@ -18,7 +18,7 @@ Wrapper script (bash — run it with the Bash tool):
 | `review` | user wants Codex's built-in code review of a diff | read-only | target: `--uncommitted` (default), `--base BRANCH`, `--commit SHA`. **No PROMPT** — free-form review instructions go through `ask`. |
 | `ask` | second opinion, explanation, design critique, free-form review | read-only | Codex can read the repo but cannot write. |
 | `delegate` | user asks Codex to implement / modify something | workspace-write | approvals go through Codex automatic review. |
-| `resume` | follow-up on a previous Codex session | `--mode read-only` (default) or `--mode workspace-write` | `--last` or the `session:` id printed earlier. |
+| `resume` | follow-up on a previous Codex session | `--mode read-only` (default) or `--mode workspace-write` | `--last`, or the UUID from the `session:` line (nothing else is accepted). |
 
 Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|…` (passthrough to Codex's `model_reasoning_effort`).
 

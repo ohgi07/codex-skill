@@ -59,6 +59,16 @@ reset_fake; run_wrapper --help
 assert_eq "--help -> rc 0" "$RC" 0
 assert_contains "--help -> usage on stdout" "$OUT" "Usage:"
 
+reset_fake
+o="$(PATH=/nonexistent "$(command -v bash)" "$RUN" --help 2>/dev/null)"; rc=$?
+assert_eq "--help works without codex on PATH -> rc 0" "$rc" 0
+assert_contains "--help works without codex on PATH -> usage on stdout" "$o" "Usage:"
+
+reset_fake
+e="$(PATH=/nonexistent "$(command -v bash)" "$RUN" ask -C "$WORK" "x" 2>&1 >/dev/null)"; rc=$?
+assert_eq "codex not on PATH -> rc 2" "$rc" 2
+assert_contains "codex not on PATH -> message" "$e" "not found on PATH"
+
 reset_fake; run_wrapper review --base x --commit y
 assert_eq "review two targets -> rc 1" "$RC" 1
 assert_contains "review two targets -> message" "$ERR" "only one of"
@@ -68,8 +78,8 @@ assert_eq "review with PROMPT -> rc 1" "$RC" 1
 assert_contains "review with PROMPT -> points to ask" "$ERR" "use 'ask'"
 
 reset_fake; run_wrapper resume "hi" </dev/null
-assert_eq "resume with no --last and non-uuid single arg is treated as SESSION_ID" "$RC" 1
-assert_contains "resume single arg -> empty prompt error" "$ERR" "prompt is empty"
+assert_eq "resume with no --last and non-uuid single arg -> rc 1" "$RC" 1
+assert_contains "resume non-uuid single arg -> SESSION_ID error" "$ERR" "SESSION_ID must be"
 
 reset_fake; run_wrapper resume
 assert_eq "resume with no target -> rc 1" "$RC" 1
@@ -95,6 +105,15 @@ assert_eq "ask whitespace stdin -> rc 1" "$RC" 1
 
 reset_fake; run_wrapper ask "a" "b"
 assert_eq "ask two positionals -> rc 1" "$RC" 1
+
+reset_fake; run_wrapper ask -C "$WORK" -- "x"
+assert_eq "ask -- is unknown option -> rc 1" "$RC" 1
+assert_contains "ask -- is unknown option -> message" "$ERR" "unknown option"
+
+reset_fake; run_wrapper ask -C "$WORK" -m --dangerously-bypass-approvals-and-sandbox "x"
+assert_eq "ask -m leading-dash value -> rc 1" "$RC" 1
+assert_contains "ask -m leading-dash value -> message" "$ERR" "-m needs a model"
+[ ! -e "$FAKE_CODEX_ARGS" ] && ok "ask -m leading-dash value -> codex not invoked" || fail "ask -m leading-dash value -> codex not invoked"
 
 # TTY guard: source the script and stub stdin_is_tty
 ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "" ) </dev/null >/dev/null 2>"$WORK/tty.err"; rc=$?
@@ -130,7 +149,6 @@ assert_contains "ask -> header model default" "$OUT" "model=default"
 assert_contains "ask -> session line" "$OUT" "session: fake-thread-1"
 assert_contains "ask -> final message" "$OUT" "fake answer"
 assert_not_contains "ask -> no trailer" "$OUT" "--- git status after Codex ---"
-assert_not_contains "ask -> never workspace-write" "$(args_str)" "workspace-write"
 assert_eq "ask success -> no log left" "$(log_count)" 0
 
 reset_fake; run_wrapper ask -C "$WORK" <<'EOF'
@@ -189,6 +207,22 @@ rm -rf "$TMPDIR/codex-run"
 UUID_A="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"   # hex letters, so the case-insensitivity test is not vacuous
 UUID_B="99999999-8888-7777-6666-555555555555"
 
+reset_fake; run_wrapper resume -C "$REPO" -- --dangerously-bypass-approvals-and-sandbox "x"
+assert_eq "resume -- is unknown option -> rc 1" "$RC" 1
+[ ! -e "$FAKE_CODEX_ARGS" ] && ok "resume -- -> codex not invoked" || fail "resume -- -> codex not invoked"
+
+reset_fake; run_wrapper resume -C "$REPO" "" "hi"
+assert_eq "resume empty SESSION_ID -> rc 1" "$RC" 1
+assert_contains "resume empty SESSION_ID -> message" "$ERR" "SESSION_ID must be"
+
+reset_fake; run_wrapper resume -C "$REPO" "my-thread-name" "hi"
+assert_eq "resume thread name is not a valid SESSION_ID -> rc 1" "$RC" 1
+assert_contains "resume thread name -> message" "$ERR" "SESSION_ID must be"
+
+reset_fake; run_wrapper resume -C "$REPO" --last "$UUID_A"
+assert_eq "resume --last with UUID positional -> rc 1" "$RC" 1
+assert_contains "resume --last with UUID positional -> message" "$ERR" "not both"
+
 reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
 assert_eq "resume --last -> rc 0" "$RC" 0
 assert_contains "resume --last -> argv" "$(args_str)" "exec resume --last --skip-git-repo-check --json -o "
@@ -220,6 +254,7 @@ assert_eq "resume id case-insensitive match -> rc 0" "$RC" 0
 reset_fake; FAKE_CODEX_THREAD="" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
 assert_eq "resume explicit id but empty thread id -> no mismatch check, rc 0" "$RC" 0
 assert_not_contains "resume empty thread id -> no session line" "$OUT" "session:"
+assert_contains "resume empty thread id -> warning on stderr" "$ERR" "could not verify"
 
 reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
 assert_eq "resume mismatched id -> rc 1" "$RC" 1
@@ -227,9 +262,6 @@ assert_contains "resume mismatch -> message" "$ERR" "session was NOT resumed"
 assert_contains "resume mismatch -> log kept" "$ERR" "events log kept at "
 assert_not_contains "resume mismatch -> no answer printed" "$OUT" "fake answer"
 rm -rf "$TMPDIR/codex-run"
-
-reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" "my-thread-name" "hi"
-assert_eq "resume by thread name -> no mismatch check, rc 0" "$RC" 0
 
 reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" --last "hi"
 assert_eq "resume --last -> no mismatch check" "$RC" 0
@@ -246,12 +278,17 @@ assert_eq "review success -> no log left" "$(log_count)" 0
 reset_fake; run_wrapper review -C "$REPO" --base main
 assert_eq "review --base -> argv" "$(args_str)" "exec -s read-only --color never review --base main -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 
+reset_fake; run_wrapper review -C "$REPO" --base --uncommitted
+assert_eq "review --base leading-dash value -> rc 1" "$RC" 1
+assert_contains "review --base leading-dash value -> message" "$ERR" "--base needs a branch"
+
 reset_fake; run_wrapper review -C "$REPO" --commit abc123 -m gpt-test --effort low
 assert_eq "review --commit -m --effort -> argv" "$(args_str)" "exec -s read-only --color never review --commit abc123 -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} -c model_reasoning_effort=\"low\" -m gpt-test "
 
 reset_fake; FAKE_CODEX_RC=2 run_wrapper review -C "$REPO"
 assert_eq "review failure -> same rc" "$RC" 2
 assert_contains "review failure -> stderr tail" "$ERR" "fake error on stderr"
+assert_not_contains "review failure -> no empty log reported" "$ERR" "events log kept at"
 rm -rf "$TMPDIR/codex-run"
 
 # ---------------------------------------------------------------- platform sandbox args

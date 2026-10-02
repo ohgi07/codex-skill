@@ -401,7 +401,8 @@ for trig in "codex" "코덱스" "codex 리뷰" "codex한테 시켜" "코덱스�
   assert_contains "SKILL.md trigger: $trig" "$(head -n 4 "$SKILL" 2>/dev/null)" "$trig"   # description is line 3
 done
 assert_contains "SKILL.md mentions git diff rule" "$(cat "$SKILL" 2>/dev/null)" "git diff"
-assert_contains "SKILL.md mentions timeout" "$(cat "$SKILL" 2>/dev/null)" "600000"
+assert_contains "SKILL.md mentions background run" "$(cat "$SKILL" 2>/dev/null)" "run_in_background: true"
+assert_contains "SKILL.md mentions timeout" "$(cat "$SKILL" 2>/dev/null)" "7200000"
 assert_contains "SKILL.md mentions resume default read-only" "$(cat "$SKILL" 2>/dev/null)" "--mode workspace-write"
 assert_contains "SKILL.md documents status mode" "$(cat "$SKILL" 2>/dev/null)" '`status`'
 [ -f "$HERE/../DESIGN.md" ] && ok "DESIGN.md exists" || fail "DESIGN.md exists"

@@ -226,7 +226,7 @@ do not fire):
 
 Rules for Claude:
 1. Always pass `-C` with the absolute project path; feed prompts via heredoc on stdin.
-2. Bash tool `timeout: 600000`; for large delegations use `run_in_background: true` and report when done.
+2. Bash tool `run_in_background: true` with `timeout: 7200000`; report when done.
 3. After `delegate` (or `resume --mode workspace-write`): run `git diff` and
    review the changes yourself before telling the user it's done — Codex's
    output is a proposal, not a verified result.

@@ -39,7 +39,7 @@ Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|�
 6. **`resume` defaults to read-only.** Pass `--mode workspace-write` only when the follow-up is meant to edit files — including "now add a test" after a `delegate`. Keep the UUID from `session:` for follow-ups on a specific job; `--last` moves to whatever session ran most recently in that directory.
 7. **Never** edit the wrapper to add `--dangerously-*` flags, and never call `codex` directly with them.
 8. **Codex never commits; Claude does, after review.** Every `delegate` / `resume --mode workspace-write` prompt ends with "Do not commit." Claude commits after reviewing the diff, following the user's and the project's commit conventions (including any rules on AI attribution). If HEAD moved during the run (compare with the value recorded in rule 4), inspect `git log <before>..HEAD`; only when every commit in that range is Codex's (made during the run, touching its task) undo them with `git reset --soft <before>` (changes stay staged), review, then commit yourself. Anything else in that range — ask the user.
-9. **Read-only modes run Codex in a real sandbox** (`ask`, `review`, `resume` without `--mode workspace-write`): writes are refused at the OS level, there is **no network access**, and `approval_policy=never` means Codex cannot ask for an escalation. On Windows the wrapper enables Codex's Windows sandbox backend per call (`unelevated`); `CODEX_RUN_WINDOWS_SANDBOX=elevated` selects the elevated backend if the user has set it up.
+9. **Read-only modes run Codex in a real sandbox** (`ask`, `review`, `resume` without `--mode workspace-write`): writes are refused at the OS level, shell commands have **no network access** (`curl`, `pip install`, `git fetch` fail) — web search still works (`--search` on every call; the tool runs on OpenAI's side) — and `approval_policy=never` means Codex cannot ask for an escalation. On Windows the wrapper enables Codex's Windows sandbox backend per call (`unelevated`); `CODEX_RUN_WINDOWS_SANDBOX=elevated` selects the elevated backend if the user has set it up.
 
 ## Writing the prompt
 
@@ -53,7 +53,7 @@ A prompt has these parts, in this order:
 4. **Verification** — which tests/commands to run; if it cannot run them, report the command and why.
 5. **Answer shape** — `ask`: findings ranked by importance, each with `file:line` evidence, assumptions and unverified points listed separately. `delegate`: files changed, what was done, test results, open problems. Name the answer language if not English.
 
-For `ask` and read-only `resume` also say: put reports or patches in the final message, not in files (writes fail); a test or build that needs to write caches, snapshots or generated files is blocked by the sandbox — report that as "could not run (sandbox)", distinct from a test that ran and failed; any web content is fetched by Claude and pasted into the prompt.
+For `ask` and read-only `resume` also say: put reports or patches in the final message, not in files (writes fail); a test or build that needs to write caches, snapshots or generated files is blocked by the sandbox — report that as "could not run (sandbox)", distinct from a test that ran and failed; Codex can use its web search tool, but commands that need network (installs, `curl`) fail in the sandbox.
 
 ## Output format
 

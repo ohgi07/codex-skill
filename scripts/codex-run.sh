@@ -15,6 +15,8 @@
 #   Windows (msys/cygwin) -> -c windows.sandbox="unelevated" on every call. Without Codex's Windows sandbox
 #                            backend there is NO sandbox on Windows and "read-only" is not enforced at all.
 #                            CODEX_RUN_WINDOWS_SANDBOX=elevated selects the stronger backend once set up.
+#   web search            -> top-level --search on every exec call. The web_search tool runs on OpenAI's side;
+#                            shell commands inside the sandbox still have no network.
 # This script never passes any flag that bypasses sandboxing or approvals.
 
 usage() {
@@ -36,6 +38,8 @@ Modes:
             rate-limit usage Codex last recorded. With --last (newest session in DIR) or SESSION_ID also shows
             that session's effective model/sandbox/approval and token totals. Reads \$CODEX_HOME/sessions only;
             no API call.
+
+Web search: on in every mode (codex --search); sandboxed shell commands still have no network.
 
 Prompt: last positional argument, or \`-\` / omitted to read stdin (heredoc-friendly).
 Env:    CODEX_RUN_KEEP_LOG=1                keeps the raw JSONL event log even on success.
@@ -188,12 +192,12 @@ build_cmd() {
     review)
       # -s goes on `exec` (review has no -s); -c sandbox_mode is added on `review` too so the
       # read-only guarantee does not depend on how the parent flag propagates.
-      CMD=(codex exec -s read-only --color never review "${REVIEW_TARGET[@]}" -c 'sandbox_mode="read-only"' "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}") ;;
+      CMD=(codex --search exec -s read-only --color never review "${REVIEW_TARGET[@]}" -c 'sandbox_mode="read-only"' "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}") ;;
     ask)
-      CMD=(codex exec -s read-only "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      CMD=(codex --search exec -s read-only "${ro_policy[@]}" "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
     delegate)
       # --approve-for-me already selects the workspace-write sandbox; 0.154.0 rejects it combined with -s.
-      CMD=(codex exec --approve-for-me "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      CMD=(codex --search exec --approve-for-me "${PLATFORM_ARGS[@]}" --color never --skip-git-repo-check --json -o "$OUT_FILE" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
     resume)
       local -a target policy
       if [ "$RESUME_LAST" -eq 1 ]; then target=(--last); else target=("$SESSION_ID"); fi
@@ -202,7 +206,7 @@ build_cmd() {
       else
         policy=(-c 'sandbox_mode="read-only"' "${ro_policy[@]}")
       fi
-      CMD=(codex exec resume "${target[@]}" --skip-git-repo-check --json -o "$OUT_FILE" "${policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
+      CMD=(codex --search exec resume "${target[@]}" --skip-git-repo-check --json -o "$OUT_FILE" "${policy[@]}" "${PLATFORM_ARGS[@]}" "${CFG_ARGS[@]}" "${MODEL_ARGS[@]}" -) ;;
   esac
 }
 
@@ -394,7 +398,7 @@ run_status() {
   set_platform_args
   local plat="none"
   [ "${#PLATFORM_ARGS[@]}" -eq 0 ] || plat="${PLATFORM_ARGS[1]}"
-  echo "wrapper: $plat | read-only modes: approval_policy=never | delegate: --approve-for-me"
+  echo "wrapper: $plat | read-only modes: approval_policy=never | delegate: --approve-for-me | web search: on"
 
   local target="" usage_file="" usage_line=""
   if [ -n "$SESSION_ID" ]; then

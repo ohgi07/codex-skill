@@ -139,7 +139,7 @@ assert_eq "extract_thread_id no thread.started under pipefail -> empty, no abort
 # ---------------------------------------------------------------- ask
 reset_fake; run_wrapper ask -C "$WORK" "what is this"
 assert_eq "ask -> rc 0" "$RC" 0
-assert_contains "ask -> argv" "$(args_str)" "exec -s read-only${RO_POLICY}${PLAT} --color never --skip-git-repo-check --json -o "
+assert_contains "ask -> argv" "$(args_str)" "--search exec -s read-only${RO_POLICY}${PLAT} --color never --skip-git-repo-check --json -o "
 assert_not_contains "ask -> no write policy" "$(args_str)" "workspace-write"
 assert_not_contains "ask -> no approve-for-me" "$(args_str)" "approve"
 assert_eq "ask -> prompt via stdin '-'" "$(tail -n 1 "$FAKE_CODEX_ARGS")" "-"
@@ -172,7 +172,7 @@ REPO="$WORK/repo"; rm -rf "$REPO"; mkdir -p "$REPO"
 git -C "$REPO" init -q && git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 reset_fake; FAKE_CODEX_TOUCH="$REPO/new.txt" run_wrapper delegate -C "$REPO" "make a file"
 assert_eq "delegate -> rc 0" "$RC" 0
-assert_contains "delegate -> argv" "$(args_str)" "exec --approve-for-me${PLAT} --color never --skip-git-repo-check --json -o "
+assert_contains "delegate -> argv" "$(args_str)" "--search exec --approve-for-me${PLAT} --color never --skip-git-repo-check --json -o "
 assert_not_contains "delegate -> no -s (mutually exclusive with --approve-for-me in 0.154.0)" "$(args_str)" " -s "
 assert_not_contains "delegate -> no approval_policy=never" "$(args_str)" 'approval_policy="never"'
 assert_contains "delegate -> header" "$OUT" "[codex delegate] cwd="
@@ -225,7 +225,7 @@ assert_contains "resume --last with UUID positional -> message" "$ERR" "not both
 
 reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
 assert_eq "resume --last -> rc 0" "$RC" 0
-assert_contains "resume --last -> argv" "$(args_str)" "exec resume --last --skip-git-repo-check --json -o "
+assert_contains "resume --last -> argv" "$(args_str)" "--search exec resume --last --skip-git-repo-check --json -o "
 assert_contains "resume default -> sandbox read-only" "$(args_str)" ' -c sandbox_mode="read-only" '
 assert_contains "resume default -> read-only policy" "$(args_str)" " -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 assert_not_contains "resume default -> no auto_review" "$(args_str)" "auto_review"
@@ -245,7 +245,7 @@ assert_contains "resume ww -> trailer lists file" "$OUT" "?? resumed.txt"
 
 reset_fake; FAKE_CODEX_THREAD="$UUID_A" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
 assert_eq "resume matching id -> rc 0" "$RC" 0
-assert_contains "resume id -> argv has id" "$(args_str)" "exec resume $UUID_A "
+assert_contains "resume id -> argv has id" "$(args_str)" "--search exec resume $UUID_A "
 assert_contains "resume matching id -> session line" "$OUT" "session: $UUID_A"
 
 reset_fake; FAKE_CODEX_THREAD="$(tr 'a-f' 'A-F' <<< "$UUID_A")" run_wrapper resume -C "$REPO" "$UUID_A" "hi"
@@ -269,21 +269,21 @@ assert_eq "resume --last -> no mismatch check" "$RC" 0
 # ---------------------------------------------------------------- review
 reset_fake; run_wrapper review -C "$REPO"
 assert_eq "review default -> rc 0" "$RC" 0
-assert_eq "review default -> argv" "$(args_str)" "exec -s read-only --color never review --uncommitted -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
+assert_eq "review default -> argv" "$(args_str)" "--search exec -s read-only --color never review --uncommitted -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 assert_contains "review -> header" "$OUT" "[codex review] cwd="
 assert_contains "review -> passthrough output" "$OUT" "fake review output"
 assert_not_contains "review -> no --json" "$(args_str)" "--json"
 assert_eq "review success -> no log left" "$(log_count)" 0
 
 reset_fake; run_wrapper review -C "$REPO" --base main
-assert_eq "review --base -> argv" "$(args_str)" "exec -s read-only --color never review --base main -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
+assert_eq "review --base -> argv" "$(args_str)" "--search exec -s read-only --color never review --base main -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 
 reset_fake; run_wrapper review -C "$REPO" --base --uncommitted
 assert_eq "review --base leading-dash value -> rc 1" "$RC" 1
 assert_contains "review --base leading-dash value -> message" "$ERR" "--base needs a branch"
 
 reset_fake; run_wrapper review -C "$REPO" --commit abc123 -m gpt-test --effort low
-assert_eq "review --commit -m --effort -> argv" "$(args_str)" "exec -s read-only --color never review --commit abc123 -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} -c model_reasoning_effort=\"low\" -m gpt-test "
+assert_eq "review --commit -m --effort -> argv" "$(args_str)" "--search exec -s read-only --color never review --commit abc123 -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} -c model_reasoning_effort=\"low\" -m gpt-test "
 
 reset_fake; FAKE_CODEX_RC=2 run_wrapper review -C "$REPO"
 assert_eq "review failure -> same rc" "$RC" 2
@@ -338,7 +338,7 @@ assert_contains "status -> codex version" "$OUT" "codex:   fake-codex 9.9.9"
 assert_contains "status -> login" "$OUT" "login: Logged in using Fake"
 assert_contains "status -> config model/effort/reviewer from top-level keys" "$OUT" "config:  model=cfg-model  effort=high  approvals_reviewer=auto_review"
 assert_not_contains "status -> ignores [projects] section" "$OUT" "not-this-one"
-assert_contains "status -> wrapper policy line" "$OUT" "read-only modes: approval_policy=never | delegate: --approve-for-me"
+assert_contains "status -> wrapper policy line" "$OUT" "read-only modes: approval_policy=never | delegate: --approve-for-me | web search: on"
 assert_contains "status -> limits from newest session overall (B)" "$OUT" "limits:  plan=pro  5h window 77.5% used"
 assert_contains "status -> weekly window" "$OUT" "weekly 88% used"
 assert_contains "status -> limits source noted" "$OUT" "session $SID_B"

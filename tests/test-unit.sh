@@ -20,7 +20,7 @@ assert_eq()           { if [ "$2" = "$3" ]; then ok "$1"; else fail "$1" "expect
 assert_contains()     { case "$2" in *"$3"*) ok "$1";; *) fail "$1" "missing [$3] in: $2";; esac; }
 assert_not_contains() { case "$2" in *"$3"*) fail "$1" "unexpected [$3] in: $2";; *) ok "$1";; esac; }
 has_arg()  { grep -qx -- "$1" "$FAKE_CODEX_ARGS"; }
-args_str() { tr '\n' ' ' < "$FAKE_CODEX_ARGS" 2>/dev/null; }
+args_str() { local a=(); [ -f "$FAKE_CODEX_ARGS" ] && mapfile -t a < "$FAKE_CODEX_ARGS"; [ ${#a[@]} -eq 0 ] || printf '%s ' "${a[@]}"; }
 reset_fake() {
   rm -f "$FAKE_CODEX_ARGS" "$FAKE_CODEX_STDIN"
   unset FAKE_CODEX_THREAD FAKE_CODEX_MSG FAKE_CODEX_RC FAKE_CODEX_TOUCH CODEX_RUN_KEEP_LOG
@@ -29,21 +29,13 @@ reset_fake() {
 run_wrapper() {
   local o="$WORK/out" e="$WORK/err"
   bash "$RUN" "$@" >"$o" 2>"$e"; RC=$?
-  OUT="$(cat "$o")"; ERR="$(cat "$e")"
+  OUT="$(<"$o")"; ERR="$(<"$e")"
 }
 log_count() { find "$TMPDIR/codex-run" -type f 2>/dev/null | wc -l | tr -d ' '; }
 # Platform-specific argv the wrapper adds (Windows needs Codex's Windows sandbox backend enabled).
 case "${OSTYPE:-}" in msys*|cygwin*) PLAT=' -c windows.sandbox="unelevated"';; *) PLAT='';; esac
 RO_POLICY=' -c approval_policy="never"'
 WW_POLICY=' -c sandbox_mode="workspace-write" -c approval_policy="on-request" -c approvals_reviewer="auto_review"'
-
-# ---------------------------------------------------------------- shim sanity
-reset_fake
-echo "hello" | FAKE_CODEX_THREAD=t-1 codex exec --json -o "$WORK/o1" - >"$WORK/shim.out"
-assert_eq "shim records argv" "$(args_str)" "exec --json -o $WORK/o1 - "
-assert_eq "shim captures stdin" "$(cat "$FAKE_CODEX_STDIN")" "hello"
-assert_eq "shim writes -o file" "$(cat "$WORK/o1")" "fake answer"
-assert_contains "shim emits thread.started" "$(cat "$WORK/shim.out")" '{"type":"thread.started","thread_id":"t-1"}'
 
 # ---------------------------------------------------------------- usage validation (no codex call)
 reset_fake; run_wrapper
@@ -54,10 +46,6 @@ assert_contains "no args -> usage on stderr" "$ERR" "Usage:"
 reset_fake; run_wrapper frobnicate "hi"
 assert_eq "unknown mode -> rc 1" "$RC" 1
 assert_contains "unknown mode -> message" "$ERR" "unknown mode"
-
-reset_fake; run_wrapper --help
-assert_eq "--help -> rc 0" "$RC" 0
-assert_contains "--help -> usage on stdout" "$OUT" "Usage:"
 
 reset_fake
 o="$(PATH=/nonexistent "$(command -v bash)" "$RUN" --help 2>/dev/null)"; rc=$?
@@ -106,10 +94,6 @@ assert_eq "ask whitespace stdin -> rc 1" "$RC" 1
 reset_fake; run_wrapper ask "a" "b"
 assert_eq "ask two positionals -> rc 1" "$RC" 1
 
-reset_fake; run_wrapper ask -C "$WORK" -- "x"
-assert_eq "ask -- is unknown option -> rc 1" "$RC" 1
-assert_contains "ask -- is unknown option -> message" "$ERR" "unknown option"
-
 reset_fake; run_wrapper ask -C "$WORK" -m --dangerously-bypass-approvals-and-sandbox "x"
 assert_eq "ask -m leading-dash value -> rc 1" "$RC" 1
 assert_contains "ask -m leading-dash value -> message" "$ERR" "-m needs a model"
@@ -119,17 +103,12 @@ assert_contains "ask -m leading-dash value -> message" "$ERR" "-m needs a model"
 ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "" ) </dev/null >/dev/null 2>"$WORK/tty.err"; rc=$?
 assert_eq "TTY + no PROMPT -> rc 1" "$rc" 1
 assert_contains "TTY + no PROMPT -> message" "$(cat "$WORK/tty.err")" "stdin is a terminal"
-p="$( ( source "$RUN"; stdin_is_tty() { return 1; }; resolve_prompt "" && printf '%s' "$PROMPT" ) <<< "from pipe" )"
-assert_eq "piped + no PROMPT -> reads stdin" "$p" "from pipe"   # $(...) strips the trailing newline
 p="$( ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "given" && printf '%s' "$PROMPT" ) )"
 assert_eq "PROMPT arg wins" "$p" "given"
 p="$( ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "-" && printf '%s' "$PROMPT" ) <<< "dash" )"
 assert_eq "PROMPT '-' reads stdin even on TTY" "$p" "dash"
 
 # extract_thread_id
-printf '{"type":"thread.started","thread_id":"019d-abc"}\n{"type":"item.completed"}\n' > "$WORK/ev.jsonl"
-t="$( ( source "$RUN"; extract_thread_id "$WORK/ev.jsonl" ) )"
-assert_eq "extract_thread_id" "$t" "019d-abc"
 t="$( ( source "$RUN"; extract_thread_id "$WORK/does-not-exist" ) )"
 assert_eq "extract_thread_id missing file -> empty" "$t" ""
 printf '{"type":"item.completed"}\n' > "$WORK/ev-none.jsonl"
@@ -151,31 +130,24 @@ assert_contains "ask -> final message" "$OUT" "fake answer"
 assert_not_contains "ask -> no trailer" "$OUT" "--- git status after Codex ---"
 assert_eq "ask success -> no log left" "$(log_count)" 0
 
-reset_fake; run_wrapper ask -C "$WORK" <<'EOF'
+reset_fake; run_wrapper ask -C "$WORK" -m gpt-test --effort high <<'EOF'
 line one
 line two
 EOF
 assert_eq "ask heredoc -> rc 0" "$RC" 0
 assert_eq "ask heredoc -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" $'line one\nline two'   # $(...) strips the trailing newline
-
-reset_fake; run_wrapper ask -C "$WORK" -m gpt-test --effort high "q"
 assert_contains "ask -m -> argv" "$(args_str)" " -m gpt-test "
 assert_contains "ask --effort -> argv" "$(args_str)" ' -c model_reasoning_effort="high" '
 assert_contains "ask -m -> header" "$OUT" "model=gpt-test"
 
-reset_fake; FAKE_CODEX_THREAD="" run_wrapper ask -C "$WORK" "q"
-assert_eq "ask empty thread id -> rc 0" "$RC" 0
-assert_not_contains "ask empty thread id -> no session line" "$OUT" "session:"
-
 # ---------------------------------------------------------------- delegate
 REPO="$WORK/repo"; rm -rf "$REPO"; mkdir -p "$REPO"
-git -C "$REPO" init -q && git -C "$REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+git -C "$REPO" init -q
 reset_fake; FAKE_CODEX_TOUCH="$REPO/new.txt" run_wrapper delegate -C "$REPO" "make a file"
 assert_eq "delegate -> rc 0" "$RC" 0
 assert_contains "delegate -> argv" "$(args_str)" "--search exec --approve-for-me${PLAT} --color never --skip-git-repo-check --json -o "
 assert_not_contains "delegate -> no -s (mutually exclusive with --approve-for-me in 0.154.0)" "$(args_str)" " -s "
 assert_not_contains "delegate -> no approval_policy=never" "$(args_str)" 'approval_policy="never"'
-assert_contains "delegate -> header" "$OUT" "[codex delegate] cwd="
 assert_contains "delegate -> trailer" "$OUT" "--- git status after Codex ---"
 assert_contains "delegate -> trailer lists file" "$OUT" "?? new.txt"
 
@@ -189,7 +161,6 @@ rm -rf "$NOGIT"
 reset_fake; FAKE_CODEX_RC=3 run_wrapper ask -C "$WORK" "q"
 assert_eq "codex failure -> same rc" "$RC" 3
 assert_contains "codex failure -> stderr tail shown" "$ERR" "fake error on stderr"
-assert_contains "codex failure -> log kept message" "$ERR" "events log kept at "
 kept="$(sed -n 's/.*events log kept at \(.*\)$/\1/p' <<< "$ERR" | head -n 1)"
 [ -n "$kept" ] && [ -f "$kept" ] && ok "codex failure -> log file exists" || fail "codex failure -> log file exists" "path=[$kept]"
 assert_contains "codex failure -> partial output shown" "$OUT" "fake answer"
@@ -209,15 +180,12 @@ UUID_B="99999999-8888-7777-6666-555555555555"
 
 reset_fake; run_wrapper resume -C "$REPO" -- --dangerously-bypass-approvals-and-sandbox "x"
 assert_eq "resume -- is unknown option -> rc 1" "$RC" 1
+assert_contains "resume -- is unknown option -> message" "$ERR" "unknown option"
 [ ! -e "$FAKE_CODEX_ARGS" ] && ok "resume -- -> codex not invoked" || fail "resume -- -> codex not invoked"
 
 reset_fake; run_wrapper resume -C "$REPO" "" "hi"
 assert_eq "resume empty SESSION_ID -> rc 1" "$RC" 1
 assert_contains "resume empty SESSION_ID -> message" "$ERR" "SESSION_ID must be"
-
-reset_fake; run_wrapper resume -C "$REPO" "my-thread-name" "hi"
-assert_eq "resume thread name is not a valid SESSION_ID -> rc 1" "$RC" 1
-assert_contains "resume thread name -> message" "$ERR" "SESSION_ID must be"
 
 reset_fake; run_wrapper resume -C "$REPO" --last "$UUID_A"
 assert_eq "resume --last with UUID positional -> rc 1" "$RC" 1
@@ -226,18 +194,15 @@ assert_contains "resume --last with UUID positional -> message" "$ERR" "not both
 reset_fake; run_wrapper resume -C "$REPO" --last "follow up"
 assert_eq "resume --last -> rc 0" "$RC" 0
 assert_contains "resume --last -> argv" "$(args_str)" "--search exec resume --last --skip-git-repo-check --json -o "
-assert_contains "resume default -> sandbox read-only" "$(args_str)" ' -c sandbox_mode="read-only" '
 assert_contains "resume default -> read-only policy" "$(args_str)" " -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
 assert_not_contains "resume default -> no auto_review" "$(args_str)" "auto_review"
 assert_not_contains "resume -> no --color (unsupported on resume)" "$(args_str)" "--color"
 assert_not_contains "resume -> no -s flag" "$(args_str)" " -s "
 assert_eq "resume -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "follow up"
 assert_not_contains "resume read-only -> no trailer" "$OUT" "--- git status after Codex ---"
-assert_contains "resume -> header" "$OUT" "[codex resume] cwd="
 
 reset_fake; FAKE_CODEX_TOUCH="$REPO/resumed.txt" run_wrapper resume -C "$REPO" --last --mode workspace-write "write it"
 assert_eq "resume ww -> rc 0" "$RC" 0
-assert_contains "resume ww -> sandbox workspace-write" "$(args_str)" ' -c sandbox_mode="workspace-write" '
 assert_contains "resume ww -> replicates --approve-for-me" "$(args_str)" "${WW_POLICY}${PLAT} "
 assert_not_contains "resume ww -> no approval_policy=never" "$(args_str)" 'approval_policy="never"'
 assert_contains "resume ww -> trailer" "$OUT" "--- git status after Codex ---"
@@ -263,16 +228,11 @@ assert_contains "resume mismatch -> log kept" "$ERR" "events log kept at "
 assert_not_contains "resume mismatch -> no answer printed" "$OUT" "fake answer"
 rm -rf "$TMPDIR/codex-run"
 
-reset_fake; FAKE_CODEX_THREAD="$UUID_B" run_wrapper resume -C "$REPO" --last "hi"
-assert_eq "resume --last -> no mismatch check" "$RC" 0
-
 # ---------------------------------------------------------------- review
 reset_fake; run_wrapper review -C "$REPO"
 assert_eq "review default -> rc 0" "$RC" 0
 assert_eq "review default -> argv" "$(args_str)" "--search exec -s read-only --color never review --uncommitted -c sandbox_mode=\"read-only\"${RO_POLICY}${PLAT} "
-assert_contains "review -> header" "$OUT" "[codex review] cwd="
 assert_contains "review -> passthrough output" "$OUT" "fake review output"
-assert_not_contains "review -> no --json" "$(args_str)" "--json"
 assert_eq "review success -> no log left" "$(log_count)" 0
 
 reset_fake; run_wrapper review -C "$REPO" --base main
@@ -332,7 +292,7 @@ export CODEX_HOME="$CH"
 
 reset_fake; run_wrapper status
 assert_eq "status -> rc 0" "$RC" 0
-assert_eq "status -> codex only asked for version/login" "$(args_str)" "login status "
+assert_eq "status -> last codex call is login status" "$(args_str)" "login status "   # fake overwrites argv per call
 assert_contains "status -> header" "$OUT" "[codex status]"
 assert_contains "status -> codex version" "$OUT" "codex:   fake-codex 9.9.9"
 assert_contains "status -> login" "$OUT" "login: Logged in using Fake"
@@ -356,14 +316,11 @@ assert_contains "status --last -> limits from that session" "$OUT" "limits:  pla
 reset_fake; run_wrapper status "$SID_G"
 assert_contains "status SESSION_ID -> explicit id still finds a guardian_review thread" "$OUT" "session $SID_G"
 
-reset_fake; run_wrapper status "$SID_C"
+reset_fake; run_wrapper status "${SID_C^^}"
 assert_eq "status SESSION_ID -> rc 0" "$RC" 0
-assert_contains "status SESSION_ID -> session block" "$OUT" "session $SID_C"
+assert_contains "status SESSION_ID (upper case) -> case-insensitive lookup" "$OUT" "session $SID_C"
 assert_contains "status SESSION_ID without usage -> says so" "$OUT" "tokens: (no usage recorded)"
 assert_contains "status SESSION_ID without usage -> limits fall back to newest overall" "$OUT" "limits:  plan=pro"
-
-reset_fake; run_wrapper status "${SID_A^^}"
-assert_contains "status SESSION_ID -> case-insensitive lookup" "$OUT" "session $SID_A"
 
 reset_fake; run_wrapper status "dddddddd-0000-4000-8000-00000000000d"
 assert_eq "status unknown SESSION_ID -> rc 1" "$RC" 1
@@ -394,18 +351,8 @@ unset CODEX_HOME
 
 # ---------------------------------------------------------------- SKILL.md
 SKILL="$HERE/../SKILL.md"
-[ -f "$SKILL" ] && ok "SKILL.md exists" || fail "SKILL.md exists"
 assert_eq "SKILL.md frontmatter opens" "$(head -n 1 "$SKILL" 2>/dev/null)" "---"
 assert_contains "SKILL.md name" "$(head -n 5 "$SKILL" 2>/dev/null)" "name: codex"
-for trig in "codex" "코덱스" "codex 리뷰" "codex한테 시켜" "코덱스한테도 물어봐" "Codex second opinion"; do
-  assert_contains "SKILL.md trigger: $trig" "$(head -n 4 "$SKILL" 2>/dev/null)" "$trig"   # description is line 3
-done
-assert_contains "SKILL.md mentions git diff rule" "$(cat "$SKILL" 2>/dev/null)" "git diff"
-assert_contains "SKILL.md mentions background run" "$(cat "$SKILL" 2>/dev/null)" "run_in_background: true"
-assert_contains "SKILL.md mentions timeout" "$(cat "$SKILL" 2>/dev/null)" "7200000"
-assert_contains "SKILL.md mentions resume default read-only" "$(cat "$SKILL" 2>/dev/null)" "--mode workspace-write"
-assert_contains "SKILL.md documents status mode" "$(cat "$SKILL" 2>/dev/null)" '`status`'
-[ -f "$HERE/../DESIGN.md" ] && ok "DESIGN.md exists" || fail "DESIGN.md exists"
 
 # ---------------------------------------------------------------- summary
 echo

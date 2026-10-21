@@ -6,6 +6,45 @@ set -u
 : "${FAKE_CODEX_ARGS:?FAKE_CODEX_ARGS must point to a file}"
 printf '%s\n' "$@" > "$FAKE_CODEX_ARGS"
 
+# `app-server` (status --resets / --use-reset): JSON-RPC over stdio, one object per line.
+# Every request line is appended to FAKE_APP_LOG. FAKE_APP_READ / FAKE_APP_READ_AFTER are the result
+# objects of the 1st / later account/rateLimits/read calls; FAKE_APP_READ_ERROR makes reads fail;
+# FAKE_APP_OUTCOME is the consume outcome; FAKE_APP_EXIT=1 exits without answering.
+# FAKE_APP_NOISE=1 answers rateLimits/read only with an endless stream of notifications;
+# FAKE_APP_HANG=1 keeps running after stdin EOF; FAKE_APP_HANG=term also ignores SIGTERM.
+if [ "${1-}" = app-server ]; then
+  [ "${FAKE_APP_EXIT:-0}" != 1 ] || { echo "fake app-server crashed" >&2; exit 3; }
+  reads=0
+  while IFS= read -r req; do
+    printf '%s\n' "$req" >> "${FAKE_APP_LOG:-/dev/null}"
+    id=""; [[ $req =~ ^\{\"jsonrpc\":\"2.0\",\"id\":([0-9]+), ]] && id="${BASH_REMATCH[1]}"
+    echo '{"method":"account/updated","params":{"authMode":"chatgpt","planType":"plus"}}'   # noise to skip
+    case "$req" in
+      *'"method":"initialize"'*) echo "{\"id\":$id,\"result\":{\"userAgent\":\"fake\"}}" ;;
+      *'"method":"account/rateLimits/read"'*)
+        reads=$((reads + 1))
+        if [ "${FAKE_APP_NOISE:-0}" = 1 ]; then
+          while echo '{"method":"account/updated","params":{}}' 2>/dev/null; do :; done
+          exit 0
+        elif [ -n "${FAKE_APP_READ_ERROR:-}" ]; then
+          echo "{\"id\":$id,\"error\":{\"code\":-32600,\"message\":\"$FAKE_APP_READ_ERROR\"}}"
+        elif [ "$reads" -gt 1 ] && [ -n "${FAKE_APP_READ_AFTER:-}" ]; then
+          echo "{\"id\":$id,\"result\":$FAKE_APP_READ_AFTER}"
+        else
+          r="${FAKE_APP_READ:-}"; [ -n "$r" ] || r='{}'
+          echo "{\"id\":$id,\"result\":$r}"
+        fi ;;
+      *'"method":"account/rateLimitResetCredit/consume"'*)
+        echo "{\"id\":$id,\"result\":{\"outcome\":\"${FAKE_APP_OUTCOME:-reset}\"}}" ;;
+    esac
+  done
+  case "${FAKE_APP_HANG:-0}" in
+    1)    exec sleep 30 ;;
+    term) trap '' TERM; exec sleep 30 ;;   # an ignored signal stays ignored across exec
+  esac
+  exit 0
+fi
+
 if [ ! -t 0 ] && [ -n "${FAKE_CODEX_STDIN:-}" ]; then
   cat > "$FAKE_CODEX_STDIN"
 fi

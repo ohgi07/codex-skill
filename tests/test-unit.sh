@@ -262,6 +262,24 @@ assert_eq "Windows (cygwin) + CODEX_RUN_WINDOWS_SANDBOX=elevated" "$p" '-c windo
 assert_eq "CODEX_RUN_WINDOWS_SANDBOX=disabled -> rejected" "$rc" 1
 assert_contains "CODEX_RUN_WINDOWS_SANDBOX=disabled -> message" "$(cat "$WORK/plat.err")" "CODEX_RUN_WINDOWS_SANDBOX"
 
+# ---------------------------------------------------------------- JSON / format helpers (sourced)
+jv_of() { ( source "$RUN"; jv "$1" "$2"; printf '%s' "$JV" ); }
+assert_eq "jv -> string"                    "$(jv_of '{"a":"x","b":2}' a)" "x"
+assert_eq "jv -> number"                    "$(jv_of '{"a":"x","b":2}' b)" "2"
+assert_eq "jv -> null"                      "$(jv_of '{"e":null}' e)" "null"
+assert_eq "jv -> missing key is empty"      "$(jv_of '{"a":"x"}' zz)" ""
+assert_eq "jv -> empty string"              "$(jv_of '{"k":"","z":1}' k)" ""
+assert_eq "jv -> escaped quotes unescaped"  "$(jv_of '{"t":"Full \"w\" r","u":1}' t)" 'Full "w" r'
+assert_eq "jv -> other escapes kept"        "$(jv_of '{"cwd":"C:\\Users\\x"}' cwd)" 'C:\\Users\\x'
+assert_eq "jv -> last occurrence wins"      "$(jv_of '{"timestamp":"a","payload":{"timestamp":"b"}}' timestamp)" "b"
+assert_eq "jv -> key must match whole name" "$(jv_of '{"creditId":"c","id":"i"}' id)" "i"
+assert_eq "fmt_time @EPOCH -> same as date" "$( ( source "$RUN"; fmt_time @1792599994 ) )" "$(date -d @1792599994 '+%Y-%m-%d %H:%M %z')"
+assert_eq "fmt_time ISO -> same as date"    "$( ( source "$RUN"; fmt_time 2026-09-16T10:03:25.926Z ) )" "$(date -d 2026-09-16T10:03:25.926Z '+%Y-%m-%d %H:%M %z')"
+assert_eq "fmt_time unparsable -> raw"      "$( ( source "$RUN"; fmt_time nonsense ) )" "nonsense"
+assert_eq "print_window -> window, trimmed percent, reset time" \
+  "$( ( source "$RUN"; print_window '{"window_minutes":300,"used_percent":19.0,"resets_at":1789568043}' window_minutes used_percent resets_at ) )" \
+  "  5h window 19% used (resets $(date -d @1789568043 '+%Y-%m-%d %H:%M %z'))"
+
 # ---------------------------------------------------------------- status
 # Fixture CODEX_HOME shaped like the real one (Codex 0.154.0 rollout files): session_meta on line 1,
 # a turn_context line, and (for sessions that completed a turn) a token_count event with rate limits.
@@ -347,6 +365,152 @@ reset_fake; CODEX_HOME="$WORK/no-such-home" run_wrapper status
 assert_eq "status with no sessions dir -> rc 0" "$RC" 0
 assert_contains "status with no sessions dir -> limits unknown" "$OUT" "limits:  (no usage recorded yet)"
 assert_contains "status with no config -> defaults" "$OUT" "config:  model=(default)  effort=(default)  approvals_reviewer=(default)"
+
+# ---------------------------------------------------------------- status --resets / --use-reset (fake app-server)
+# Result objects shaped like Codex 0.163.0's account/rateLimits/read. rateLimitsByLimitId holds a decoy bucket
+# (1h window, plan=other) that must not leak into the limits line.
+export FAKE_APP_LOG="$WORK/app.log"
+live_read() { # pct5h pctweek count credits_json
+  printf '{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","limitName":null,"normalModelSlug":null,"primary":{"usedPercent":%s,"windowDurationMins":300,"resetsAt":1792599994},"secondary":{"usedPercent":%s,"windowDurationMins":10080,"resetsAt":1793091641},"credits":{"hasCredits":false,"unlimited":false,"balance":"0"},"individualLimit":null,"spendControlReached":false,"planType":"plus","rateLimitReachedType":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":1,"windowDurationMins":60,"resetsAt":1},"secondary":null,"planType":"other"}},"rateLimitResetCredits":{"availableCount":%s,"credits":%s},"accountId":"acc","rateLimitUpsell":null}' "$1" "$2" "$3" "$4"
+}
+credit() { # id expiresAt [title_json_body] [description_json_body]
+  printf '{"id":"%s","resetType":"codexRateLimits","status":"available","grantedAt":1790106821,"expiresAt":%s,"title":"%s","description":"%s"}' \
+    "$1" "$2" "${3:-Full reset (Weekly + 5 hr)}" "${4:-Thanks for using Codex!}"
+}
+reset_app() {
+  reset_fake; rm -f "$FAKE_APP_LOG"
+  unset FAKE_APP_READ FAKE_APP_READ_AFTER FAKE_APP_READ_ERROR FAKE_APP_OUTCOME FAKE_APP_EXIT FAKE_APP_NOISE FAKE_APP_HANG
+}
+app_log() { [ -f "$FAKE_APP_LOG" ] && cat "$FAKE_APP_LOG"; }
+TWO_CREDITS="[$(credit RateLimitResetCredit_late 1794002027),$(credit RateLimitResetCredit_early 1792698821)]"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; run_wrapper status --resets
+assert_eq "status --resets -> rc 0" "$RC" 0
+assert_contains "status --resets -> live limits from rateLimits" "$OUT" "limits:  plan=plus  5h window 98% used"
+assert_contains "status --resets -> live weekly window" "$OUT" "weekly 15% used"
+assert_contains "status --resets -> limits marked live" "$OUT" "live (account/rateLimits/read)"
+assert_not_contains "status --resets -> ignores rateLimitsByLimitId buckets" "$OUT" "1h window"
+assert_not_contains "status --resets -> no offline limits line" "$OUT" "session $SID_B"
+assert_contains "status --resets -> available count" "$OUT" "resets:  2 available"
+assert_contains "status --resets -> soonest-expiring credit listed first" "$(grep -A1 '^resets:' <<< "$OUT" | tail -n 1)" "1. Full reset (Weekly + 5 hr)"
+assert_contains "status --resets -> first row is the early credit" "$(grep -A1 '^resets:' <<< "$OUT" | tail -n 1)" "RateLimitResetCredit_early"
+assert_contains "status --resets -> initialize sent" "$(app_log)" '"method":"initialize"'
+assert_not_contains "status --resets -> never consumes" "$(app_log)" "rateLimitResetCredit/consume"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; run_wrapper status -C "$REPO" --resets --last
+assert_eq "status --resets --last -> rc 0" "$RC" 0
+assert_contains "status --resets --last -> session block too" "$OUT" "session $SID_A"
+
+reset_app
+export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"
+export FAKE_APP_READ_AFTER="$(live_read 0 0 1 "[$(credit RateLimitResetCredit_late 1794002027)]")"
+run_wrapper status --use-reset
+consume="$(app_log | grep 'rateLimitResetCredit/consume' || true)"
+assert_eq "status --use-reset -> rc 0" "$RC" 0
+assert_contains "status --use-reset -> consumes the soonest-expiring credit" "$consume" '"creditId":"RateLimitResetCredit_early"'
+[[ "$consume" =~ \"idempotencyKey\":\"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\" ]] \
+  && ok "status --use-reset -> UUIDv4 idempotency key" || fail "status --use-reset -> UUIDv4 idempotency key" "$consume"
+assert_eq "status --use-reset -> exactly one consume call" "$(app_log | grep -c 'rateLimitResetCredit/consume')" 1
+assert_contains "status --use-reset -> before state" "$OUT" "resets:  2 available"
+assert_contains "status --use-reset -> outcome" "$OUT" "reset:   done, used RateLimitResetCredit_early"
+assert_contains "status --use-reset -> after state re-read" "$OUT" "5h window 0% used"
+assert_contains "status --use-reset -> remaining count" "$OUT" "resets:  1 available"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 0 "[]")"; run_wrapper status --use-reset
+assert_eq "status --use-reset with no credits -> rc 1" "$RC" 1
+assert_contains "status --use-reset with no credits -> message" "$OUT" "reset:   not used, no reset credits available"
+assert_not_contains "status --use-reset with no credits -> no consume call" "$(app_log)" "rateLimitResetCredit/consume"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 null)"; run_wrapper status --use-reset
+assert_eq "status --use-reset without credit details -> rc 0" "$RC" 0
+assert_contains "status --use-reset without credit details -> count still shown" "$OUT" "resets:  2 available (no details returned)"
+assert_not_contains "status --use-reset without credit details -> backend picks the credit" "$(app_log)" '"creditId"'
+
+reset_app; export FAKE_APP_READ="$(live_read 3 1 2 "$TWO_CREDITS")" FAKE_APP_OUTCOME=nothingToReset; run_wrapper status --use-reset
+assert_eq "status --use-reset nothingToReset -> rc 1" "$RC" 1
+assert_contains "status --use-reset nothingToReset -> message" "$OUT" "no current rate-limit window is eligible"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")" FAKE_APP_OUTCOME=weird; run_wrapper status --use-reset
+assert_eq "status --use-reset unknown outcome -> rc 1" "$RC" 1
+assert_contains "status --use-reset unknown outcome -> message" "$OUT" "unexpected outcome: weird"
+
+reset_app; export FAKE_APP_READ_ERROR="chatgpt authentication required"; run_wrapper status --use-reset
+assert_eq "status --use-reset read error -> rc 1" "$RC" 1
+assert_contains "status --use-reset read error -> offline limits as fallback" "$OUT" "limits:  plan=pro"
+assert_contains "status --use-reset read error -> server message" "$OUT" "resets:  unavailable: chatgpt authentication required"
+assert_not_contains "status --use-reset read error -> no consume call" "$(app_log)" "rateLimitResetCredit/consume"
+
+reset_app; export FAKE_APP_EXIT=1; run_wrapper status --resets
+assert_eq "status --resets app-server dies -> rc 1" "$RC" 1
+assert_contains "status --resets app-server dies -> message" "$OUT" "resets:  unavailable: codex app-server exited"
+assert_contains "status --resets app-server dies -> its stderr" "$OUT" "fake app-server crashed"
+[ "$(find "$TMPDIR" -maxdepth 1 -name 'codex-run-app.*' | wc -l | tr -d ' ')" = 0 ] \
+  && ok "status --resets -> app-server stderr file removed" || fail "status --resets -> app-server stderr file removed"
+
+# Credit picking must not trust a list it cannot fully account for: a "{" inside a string hides that credit
+# from the parser, and the backend may cap the list below availableCount. Either way the server picks.
+reset_app
+export FAKE_APP_READ="$(live_read 98.0 15 2 "[$(credit RateLimitResetCredit_early 1792698821 'Full reset' 'Use {weekly} quota'),$(credit RateLimitResetCredit_late 1794002027)]")"
+run_wrapper status --use-reset
+assert_eq "status --use-reset with braces in a description -> rc 0" "$RC" 0
+assert_not_contains "status --use-reset with braces in a description -> does not pin the later credit" "$(app_log)" '"creditId"'
+assert_contains "status --use-reset with braces in a description -> says the server picks" "$OUT" "the server picks which credit to use"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 3 "[$(credit RateLimitResetCredit_late 1794002027)]")"; run_wrapper status --use-reset
+assert_eq "status --use-reset with a capped list -> rc 0" "$RC" 0
+assert_contains "status --use-reset with a capped list -> lists what it got" "$OUT" "1. Full reset (Weekly + 5 hr)"
+assert_not_contains "status --use-reset with a capped list -> does not pin a listed credit" "$(app_log)" '"creditId"'
+assert_contains "status --use-reset with a capped list -> says the server picks" "$OUT" "the server picks which credit to use"
+assert_contains "status --use-reset with a capped list -> reports the gap" "$OUT" "1 of 3 listed"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 1 "[$(credit RateLimitResetCredit_q 1794002027 'Full \"weekly\" reset')]")"; run_wrapper status --resets
+assert_contains "status --resets -> escaped quotes in a title are unescaped" "$OUT" '1. Full "weekly" reset  expires'
+assert_not_contains "status --resets -> complete list -> no server-picks note" "$OUT" "the server picks"
+
+# A server that keeps sending notifications but never answers must still hit the RPC timeout,
+# and one that ignores stdin EOF must not keep the wrapper waiting.
+# run_wrapper_capped ARGS... : run_wrapper with a 30s hard stop where `timeout` exists, so a hang fails instead of stalling.
+run_wrapper_capped() {
+  local o="$WORK/out" e="$WORK/err" cap=()
+  command -v timeout >/dev/null 2>&1 && cap=(timeout -k 5 30)
+  "${cap[@]}" bash "$RUN" "$@" >"$o" 2>"$e"; RC=$?
+  OUT="$(<"$o")"; ERR="$(<"$e")"
+}
+reset_app; export FAKE_APP_NOISE=1; t0=$SECONDS; CODEX_RUN_RPC_TIMEOUT=2 run_wrapper_capped status --resets; dt=$((SECONDS - t0))
+assert_eq "status --resets with endless notifications -> rc 1" "$RC" 1
+assert_contains "status --resets with endless notifications -> timeout message" "$OUT" "resets:  unavailable: no reply to account/rateLimits/read within 2s"
+[ "$dt" -lt 15 ] && ok "status --resets with endless notifications -> returns (${dt}s)" || fail "status --resets with endless notifications -> returns" "took ${dt}s"
+
+reset_app; export FAKE_APP_HANG=1 FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; t0=$SECONDS; CODEX_RUN_APP_GRACE=1 run_wrapper_capped status --resets; dt=$((SECONDS - t0))
+assert_eq "status --resets with a server that ignores EOF -> rc 0" "$RC" 0
+assert_contains "status --resets with a server that ignores EOF -> output intact" "$OUT" "resets:  2 available"
+[ "$dt" -lt 15 ] && ok "status --resets with a server that ignores EOF -> returns (${dt}s)" || fail "status --resets with a server that ignores EOF -> returns" "took ${dt}s"
+
+reset_app; export FAKE_APP_HANG=term FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; t0=$SECONDS; CODEX_RUN_APP_GRACE=1 run_wrapper_capped status --resets; dt=$((SECONDS - t0))
+assert_eq "status --resets with a server that ignores SIGTERM -> rc 0" "$RC" 0
+assert_contains "status --resets with a server that ignores SIGTERM -> output intact" "$OUT" "resets:  2 available"
+[ "$dt" -lt 15 ] && ok "status --resets with a server that ignores SIGTERM -> returns (${dt}s)" || fail "status --resets with a server that ignores SIGTERM -> returns" "took ${dt}s"
+
+# A "}" inside a string cuts a row short without losing it, so row counts still add up; the row has lost
+# expiresAt, so it cannot be ranked and the server must pick.
+reset_app
+export FAKE_APP_READ="$(live_read 98.0 15 2 '[{"id":"RateLimitResetCredit_early","resetType":"codexRateLimits","status":"available","description":"Use } quota","expiresAt":100,"title":"Early"},{"id":"RateLimitResetCredit_late","resetType":"codexRateLimits","status":"available","expiresAt":200,"title":"Late"}]')"
+run_wrapper status --use-reset
+assert_eq "status --use-reset with a row cut short -> rc 0" "$RC" 0
+assert_not_contains "status --use-reset with a row cut short -> does not pin the later credit" "$(app_log)" '"creditId"'
+assert_contains "status --use-reset with a row cut short -> says the server picks" "$OUT" "the server picks which credit to use"
+
+reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; run_wrapper status
+assert_not_contains "plain status -> stays offline (no app-server)" "$(app_log)" "initialize"
+
+reset_app; run_wrapper ask --resets "hi"
+assert_eq "ask --resets -> rc 1" "$RC" 1
+assert_contains "ask --resets -> message" "$ERR" "only valid for status"
+reset_app; run_wrapper resume --last --use-reset "hi"
+assert_eq "resume --use-reset -> rc 1" "$RC" 1
+assert_contains "resume --use-reset -> message" "$ERR" "only valid for status"
+reset_app
+unset FAKE_APP_LOG
 unset CODEX_HOME
 
 # ---------------------------------------------------------------- SKILL.md

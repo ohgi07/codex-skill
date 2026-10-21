@@ -5,7 +5,7 @@
 #   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 #   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
 #   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
-#   codex-run.sh status   [-C DIR] [--last | SESSION_ID]
+#   codex-run.sh status   [-C DIR] [--last | SESSION_ID] [--resets | --use-reset]
 #
 # Sandbox invariants enforced here, not assumed from Codex defaults (verified against Codex 0.154.0):
 #   review/ask            -> -s read-only + approval_policy="never"  (no escalation path out of the sandbox)
@@ -26,7 +26,7 @@ usage() {
   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
-  codex-run.sh status   [-C DIR] [--last | SESSION_ID]
+  codex-run.sh status   [-C DIR] [--last | SESSION_ID] [--resets | --use-reset]
 
 Modes:
   review    Codex's built-in code review of the repo in DIR (read-only). Default target: --uncommitted.
@@ -38,6 +38,10 @@ Modes:
             rate-limit usage Codex last recorded. With --last (newest session in DIR) or SESSION_ID also shows
             that session's effective model/sandbox/approval and token totals. Reads \$CODEX_HOME/sessions only;
             no API call.
+            --resets     asks the account (codex app-server) for live usage and the rate-limit reset
+                         credits available, instead of the last recorded reading. Read-only.
+            --use-reset  as --resets, then SPENDS one reset credit (the soonest to expire) to reset the
+                         current usage windows, and reads usage again. Irreversible.
 
 Web search: on in every mode (codex --search); sandboxed shell commands still have no network.
 
@@ -78,6 +82,7 @@ looks_like_uuid() {
 }
 
 # parse_args "$@" -> sets MODE DIR MODEL EFFORT REVIEW_TARGET RESUME_LAST SESSION_ID RESUME_MODE PROMPT_ARG
+#                      LIVE USE_RESET
 parse_args() {
   MODE="${1-}"
   case "$MODE" in
@@ -90,6 +95,7 @@ parse_args() {
   DIR="$PWD"; MODEL=""; EFFORT=""
   REVIEW_TARGET=(); local target_count=0
   RESUME_LAST=0; SESSION_ID=""; RESUME_MODE="read-only"
+  LIVE=0; USE_RESET=0
   PROMPT_ARG=""
   local -a pos=()
 
@@ -118,6 +124,12 @@ parse_args() {
         [ "$MODE" = resume ] || die "--mode is only valid for resume"
         { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "--mode needs a value"
         RESUME_MODE="$2"; shift 2 ;;
+      --resets)
+        [ "$MODE" = status ] || die "--resets is only valid for status"
+        LIVE=1; shift ;;
+      --use-reset)
+        [ "$MODE" = status ] || die "--use-reset is only valid for status"
+        LIVE=1; USE_RESET=1; shift ;;
       -)  pos+=("$1"); shift ;;
       -*) die "unknown option: $1" ;;
       *)  pos+=("$1"); shift ;;
@@ -266,28 +278,50 @@ run_review() {
 # Codex 0.154.0 writes one rollout file per session under $CODEX_HOME/sessions/YYYY/MM/DD/
 # rollout-<timestamp>-<session-id>.jsonl. Line 1 is session_meta (cwd); turn_context lines carry the
 # effective model/effort/sandbox/approval; token_count events carry cumulative usage and rate limits.
-# Parsed with grep/sed only (no jq), like extract_thread_id.
+# Parsed with bash regexes (no jq). Status output builds dozens of fields, and on Windows every $(...) forks
+# (~30ms) and every external command spawns (~50ms), so these helpers set a variable or print directly.
 
-# jget JSON KEY -> first value of "KEY": either a string or a bare number/word. Empty if absent.
-jget() {
-  printf '%s' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p; t; s/.*\"$2\":\([^,}]*\).*/\1/p" | head -n 1
+# jv JSON KEY -> JV = value of "KEY": a string (\" unescaped, other escapes kept) or a bare number/word;
+# empty if absent. When KEY occurs more than once the last one wins.
+jv() {
+  local s="\"$2\":\"(([^\"\\\\]|\\\\.)*)\"" b="\"$2\":([^,}]*)"
+  JV=""
+  if [[ $1 =~ .*$s ]]; then JV="${BASH_REMATCH[1]}"; JV="${JV//\\\"/\"}"
+  elif [[ $1 =~ .*$b ]]; then JV="${BASH_REMATCH[1]}"
+  fi
 }
 
-# fmt_time SPEC -> local time for an ISO-8601 string or @EPOCH; falls back to the raw value.
-fmt_time() { date -d "$1" '+%Y-%m-%d %H:%M %z' 2>/dev/null || printf '%s' "$1"; }
-
-# fmt_window MINUTES -> "weekly", "5h window", "3d window", "30m window".
-fmt_window() {
+# fmt_time SPEC -> prints the local time for @EPOCH or an ISO-8601 string; falls back to the raw value.
+fmt_time() {
   case "$1" in
-    10080) echo weekly ;;
-    *) if   [ "$1" -ge 1440 ] && [ $(( $1 % 1440 )) -eq 0 ]; then echo "$(( $1 / 1440 ))d window"
-       elif [ "$1" -ge 60 ]   && [ $(( $1 % 60 )) -eq 0 ];   then echo "$(( $1 / 60 ))h window"
-       else echo "${1}m window"; fi ;;
+    @[0-9]*) printf '%(%Y-%m-%d %H:%M %z)T' "${1#@}" ;;
+    *) local t; t="$(date -d "$1" '+%Y-%m-%d %H:%M %z' 2>/dev/null)" && printf '%s' "$t" || printf '%s' "$1" ;;
   esac
 }
 
-# fmt_pct 19.0 -> 19 ; 77.5 -> 77.5
-fmt_pct() { printf '%s' "$1" | sed 's/\.0$//'; }
+# fmt_window MINUTES -> prints "weekly", "5h window", "3d window", "30m window".
+fmt_window() {
+  case "$1" in
+    10080) printf weekly ;;
+    *) if   [ "$1" -ge 1440 ] && [ $(( $1 % 1440 )) -eq 0 ]; then printf '%sd window' "$(( $1 / 1440 ))"
+       elif [ "$1" -ge 60 ]   && [ $(( $1 % 60 )) -eq 0 ];   then printf '%sh window' "$(( $1 / 60 ))"
+       else printf '%sm window' "$1"; fi ;;
+  esac
+}
+
+# print_window WINDOW_JSON WINDOW_KEY PERCENT_KEY RESETS_KEY -> "  5h window 19% used (resets <time>)".
+# The keys differ between rollout files (snake_case) and app-server replies (camelCase).
+print_window() {
+  local w p
+  jv "$1" "$2"; w="$JV"; jv "$1" "$3"; p="${JV%.0}"; jv "$1" "$4"
+  printf '  '; fmt_window "$w"; printf ' %s%% used (resets ' "$p"; fmt_time "@$JV"; printf ')'
+}
+
+# first_object JSON KEY -> OBJ = the first brace-free {...} value of "KEY", or empty.
+first_object() {
+  local re="\"$2\":[{][^}]*[}]"
+  OBJ=""; [[ $1 =~ $re ]] && OBJ="${BASH_REMATCH[0]}"
+}
 
 # norm_path PATH -> lowercase, forward slashes, no trailing slash (Codex records cwd as C:\\Users\\... on Windows).
 norm_path() {
@@ -311,13 +345,14 @@ rollout_for_id() {
 # Codex's automatic reviewer runs as its own thread (thread_source "guardian_review") in the same cwd;
 # those are skipped so --last means the same session `resume --last` would pick.
 rollout_for_dir() {
-  local want f meta src
+  local want f meta
   want="$(norm_path "$1")"
   while IFS= read -r f; do
-    meta="$(head -n 1 "$f")"
-    src="$(jget "$meta" thread_source)"
-    [ -z "$src" ] || [ "$src" = user ] || continue
-    [ "$(norm_path "$(jget "$meta" cwd)")" = "$want" ] && { printf '%s' "$f"; return 0; }
+    IFS= read -r meta < "$f" || true
+    jv "$meta" thread_source
+    [ -z "$JV" ] || [ "$JV" = user ] || continue
+    jv "$meta" cwd
+    [ "$(norm_path "$JV")" = "$want" ] && { printf '%s' "$f"; return 0; }
   done < <(all_rollouts)
   return 0
 }
@@ -353,35 +388,38 @@ config_value() {
 }
 
 print_limits() {   # print_limits TOKEN_COUNT_LINE SESSION_ID
-  local line="$1" sid="$2" rl p sec plan
-  rl="$(printf '%s' "$line" | sed -n 's/.*"rate_limits":{\(.*\)}}$/\1/p')"
-  p="$(printf '%s' "$rl" | sed -n 's/.*"primary":{\([^}]*\)}.*/\1/p')"
-  sec="$(printf '%s' "$rl" | sed -n 's/.*"secondary":{\([^}]*\)}.*/\1/p')"
-  plan="$(jget "$rl" plan_type)"
-  printf 'limits:  plan=%s' "${plan:-unknown}"
-  local part
-  for part in "$p" "$sec"; do
-    [ -n "$part" ] || continue
-    printf '  %s %s%% used (resets %s)' \
-      "$(fmt_window "$(jget "$part" window_minutes)")" "$(fmt_pct "$(jget "$part" used_percent)")" \
-      "$(fmt_time "@$(jget "$part" resets_at)")"
+  local line="$1" sid="$2" rl key
+  rl="${line#*\"rate_limits\":}"
+  jv "$rl" plan_type
+  printf 'limits:  plan=%s' "${JV:-unknown}"
+  for key in primary secondary; do
+    first_object "$rl" "$key"
+    [ -z "$OBJ" ] || print_window "$OBJ" window_minutes used_percent resets_at
   done
-  printf '\n         as of %s, session %s\n' "$(fmt_time "$(jget "$line" timestamp)")" "$sid"
+  jv "$line" timestamp
+  printf '\n         as of '; fmt_time "$JV"; printf ', session %s\n' "$sid"
 }
 
 print_session() {   # print_session ROLLOUT_FILE
-  local f="$1" meta ctx usage tu
-  meta="$(head -n 1 "$f")"
+  local f="$1" meta ctx usage model effort approval k
+  local -A tu=()
+  IFS= read -r meta < "$f" || true
   ctx="$(grep '"type":"turn_context"' "$f" 2>/dev/null | tail -n 1 || true)"
   echo
-  echo "session $(session_id_of "$f")   $(fmt_time "$(jget "$meta" timestamp)")   cwd=$(jget "$meta" cwd | sed 's/\\\\/\\/g')"
+  jv "$meta" timestamp
+  printf 'session %s   ' "$(session_id_of "$f")"; fmt_time "$JV"
+  jv "$meta" cwd; printf '   cwd=%s\n' "${JV//\\\\/\\}"
   if [ -n "$ctx" ]; then
-    echo "  model=$(jget "$ctx" model)  effort=$(jget "$ctx" effort)  sandbox=$(jget "$(printf '%s' "$ctx" | sed -n 's/.*"sandbox_policy":{\([^}]*\)}.*/\1/p')" type)  approval=$(jget "$ctx" approval_policy)"
+    jv "$ctx" model; model="$JV"; jv "$ctx" effort; effort="$JV"; jv "$ctx" approval_policy; approval="$JV"
+    first_object "$ctx" sandbox_policy; jv "$OBJ" type
+    echo "  model=$model  effort=$effort  sandbox=$JV  approval=$approval"
   fi
   usage="$(last_token_count "$f")"
   if [ -n "$usage" ]; then
-    tu="$(printf '%s' "$usage" | sed -n 's/.*"total_token_usage":{\([^}]*\)}.*/\1/p')"
-    echo "  tokens: total $(jget "$tu" total_tokens) = input $(jget "$tu" input_tokens) (cached $(jget "$tu" cached_input_tokens)) + output $(jget "$tu" output_tokens)   context window $(jget "$usage" model_context_window)"
+    first_object "$usage" total_token_usage
+    for k in total_tokens input_tokens cached_input_tokens output_tokens; do jv "$OBJ" "$k"; tu[$k]="$JV"; done
+    jv "$usage" model_context_window
+    echo "  tokens: total ${tu[total_tokens]} = input ${tu[input_tokens]} (cached ${tu[cached_input_tokens]}) + output ${tu[output_tokens]}   context window $JV"
   else
     echo "  tokens: (no usage recorded)"
   fi
@@ -400,7 +438,7 @@ run_status() {
   [ "${#PLATFORM_ARGS[@]}" -eq 0 ] || plat="${PLATFORM_ARGS[1]}"
   echo "wrapper: $plat | read-only modes: approval_policy=never | delegate: --approve-for-me | web search: on"
 
-  local target="" usage_file="" usage_line=""
+  local target=""
   if [ -n "$SESSION_ID" ]; then
     target="$(rollout_for_id "$SESSION_ID")"
     [ -n "$target" ] || die "session not found: $SESSION_ID (looked under $CODEX_HOME/sessions)"
@@ -409,7 +447,20 @@ run_status() {
     [ -n "$target" ] || die "no session found for $DIR (looked under $CODEX_HOME/sessions)"
   fi
 
-  if [ -n "$target" ]; then usage_line="$(last_token_count "$target")"; usage_file="$target"; fi
+  local live_rc=0
+  if [ "$LIVE" -eq 1 ]; then
+    run_live "$target" || live_rc=$?
+  else
+    print_recorded_limits "$target"
+  fi
+
+  [ -z "$target" ] || print_session "$target"
+  return "$live_rc"
+}
+
+print_recorded_limits() {   # print_recorded_limits [ROLLOUT_FILE]
+  local usage_file="" usage_line=""
+  if [ -n "${1-}" ]; then usage_line="$(last_token_count "$1")"; usage_file="$1"; fi
   if [ -z "$usage_line" ]; then
     usage_file="$(newest_usage)"
     [ -z "$usage_file" ] || usage_line="$(last_token_count "$usage_file")"
@@ -419,8 +470,183 @@ run_status() {
   else
     echo "limits:  (no usage recorded yet)"
   fi
+}
 
-  [ -z "$target" ] || print_session "$target"
+# ---------------------------------------------------------------- status --resets / --use-reset (live)
+# `codex app-server` speaks JSON-RPC over stdio, one object per line (verified against Codex 0.163.0):
+#   initialize                            -> handshake, then the "initialized" notification
+#   account/rateLimits/read               -> live rateLimits (camelCase) + rateLimitResetCredits
+#                                            {availableCount, credits: [{id, status, expiresAt, title, …}] | null}
+#   account/rateLimitResetCredit/consume  -> params {creditId?, idempotencyKey}
+#                                            -> {outcome: reset | nothingToReset | noCredit | alreadyRedeemed}
+# Responses start with {"id":N, and are matched on that; notifications in between are skipped.
+# The server exits on stdin EOF (dropping unanswered requests), so it is closed only after the last reply.
+
+# new_uuid -> random UUIDv4 (idempotency key for one reset attempt).
+new_uuid() {
+  local h v
+  h="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  v="$(printf '%x' $(( (16#${h:16:1} & 3) | 8 )))"
+  printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
+app_open() {
+  APP_ERR="$(mktemp "${TMPDIR:-/tmp}/codex-run-app.XXXXXX")"
+  trap app_close EXIT
+  coproc APP { exec codex app-server 2>"$APP_ERR"; }
+  APP_IN="${APP[1]}"; APP_OUT="${APP[0]}"; APP_WAIT_PID="$APP_PID"; APP_SEQ=0
+  trap '' PIPE   # a dead server must fail the write, not kill the wrapper (set after the spawn: not inherited)
+  app_call initialize '{"clientInfo":{"name":"codex-run","version":"1"}}' || return 1
+  printf '%s\n' '{"jsonrpc":"2.0","method":"initialized"}' >&"$APP_IN" 2>/dev/null || true
+}
+
+# app_exited SECONDS -> polls until the server process is gone (0) or SECONDS have passed (1).
+app_exited() {
+  local deadline=$((SECONDS + $1))
+  while kill -0 "$APP_WAIT_PID" 2>/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.1
+  done
+}
+
+# app_close -> EOF on stdin, then CODEX_RUN_APP_GRACE seconds (default 5) to exit, then SIGTERM and the same
+# again, then SIGKILL, so the final wait cannot block. Its stdout is closed first so a server still writing
+# cannot block on a full pipe. On Windows the PID is the npm shim's node, which forwards SIGTERM to the
+# native binary; SIGKILL ends node only, and the binary already has EOF on both pipes.
+app_close() {
+  local grace="${CODEX_RUN_APP_GRACE:-5}"
+  if [ -n "${APP_IN-}" ]; then
+    exec {APP_IN}>&- 2>/dev/null || true
+    exec {APP_OUT}<&- 2>/dev/null || true
+    app_exited "$grace" || { kill "$APP_WAIT_PID" 2>/dev/null; app_exited "$grace"; } \
+      || kill -KILL "$APP_WAIT_PID" 2>/dev/null || true
+    wait "$APP_WAIT_PID" 2>/dev/null || true
+    APP_IN=""
+  fi
+  [ -z "${APP_ERR-}" ] || rm -f "$APP_ERR"
+}
+
+# app_call METHOD PARAMS_JSON -> RPC_LINE (the response line) or RPC_ERROR, non-zero on failure.
+app_call() {
+  local id line rc deadline left
+  APP_SEQ=$((APP_SEQ + 1)); id=$APP_SEQ; RPC_LINE=""; RPC_ERROR=""
+  if printf '{"jsonrpc":"2.0","id":%s,"method":"%s","params":%s}\n' "$id" "$1" "$2" >&"$APP_IN" 2>/dev/null; then
+    deadline=$((SECONDS + ${CODEX_RUN_RPC_TIMEOUT:-60}))
+    while :; do
+      # The deadline is absolute: notifications arriving in between do not extend it.
+      left=$((deadline - SECONDS)); rc=142
+      [ "$left" -le 0 ] || { rc=0; IFS= read -r -t "$left" line <&"$APP_OUT" 2>/dev/null || rc=$?; }
+      if [ "$rc" -gt 128 ]; then RPC_ERROR="no reply to $1 within ${CODEX_RUN_RPC_TIMEOUT:-60}s"; return 1; fi
+      [ "$rc" -eq 0 ] || break
+      case "$line" in
+        "{\"id\":$id,\"result\":"*) RPC_LINE="$line"; return 0 ;;
+        "{\"id\":$id,"*) jv "$line" message; RPC_ERROR="${JV:-$line}"; return 1 ;;
+      esac
+    done
+  fi
+  RPC_ERROR="codex app-server exited before answering $1"
+  [ ! -s "$APP_ERR" ] || RPC_ERROR="$RPC_ERROR: $(tail -n 1 "$APP_ERR")"
+  return 1
+}
+
+# print_live_limits RESULT_LINE [LABEL] -> "limits:" line from the result's top-level rateLimits snapshot.
+print_live_limits() {
+  local rl key
+  rl="${1#*\"rateLimits\":}"; rl="${rl%%\"rateLimitsByLimitId\"*}"; rl="${rl%%\"rateLimitResetCredits\"*}"
+  jv "$rl" planType
+  printf 'limits:  plan=%s' "$JV"
+  for key in primary secondary; do
+    first_object "$rl" "$key"
+    [ -z "$OBJ" ] || print_window "$OBJ" windowDurationMins usedPercent resetsAt
+  done
+  printf '\n         %slive (account/rateLimits/read)\n' "${2:+$2 }"
+}
+
+# print_resets RESULT_LINE -> "resets:" block, soonest-expiring first; sets RESET_COUNT and RESET_NEXT_ID
+# (the soonest-expiring available credit). Rows are the brace-free {...} objects naming a resetType, so a
+# "{" or "}" inside a string either hides a row or cuts it short, and the backend may cap the list; any of
+# these could hide a sooner expiry. RESET_NEXT_ID therefore stays empty, and the server picks, unless every
+# row was matched, every row has id/status/expiresAt, and the available rows add up to availableCount.
+print_resets() {
+  local rc rest row rows=() sorted=() n=0 avail=0 complete=1 key id st exp title types
+  local sep=$'\x1f' rt='"resetType"'
+  RESET_COUNT=0; RESET_NEXT_ID=""
+  rc="${1#*\"rateLimitResetCredits\":}"
+  if [ "$rc" = "$1" ] || [ "${rc:0:4}" = null ]; then echo "resets:  (not reported for this account)"; return 0; fi
+  jv "$rc" availableCount; RESET_COUNT="${JV:-0}"
+  case "${rc%%\}*}" in   # the summary up to its first "}": {"availableCount":N,"credits":null} has no rows
+    *'"credits":null'*) rest="" ;;
+    *) rest="$rc" ;;
+  esac
+  while [[ $rest =~ [{][^{}]*\"resetType\"[^{}]*[}] ]]; do
+    row="${BASH_REMATCH[0]}"; rest="${rest#*"$row"}"
+    jv "$row" id; id="$JV"; jv "$row" status; st="$JV"; jv "$row" expiresAt; exp="$JV"; jv "$row" title; title="$JV"
+    [ -n "$id" ] && [ -n "$st" ] && [ -n "$exp" ] || complete=0
+    case "$exp" in ''|null) key=99999999999 ;; *) key="$exp" ;; esac
+    rows+=("$key$sep$id$sep$st$sep$exp$sep$title")
+  done
+  if [ "${#rows[@]}" -eq 0 ]; then
+    if [ "$RESET_COUNT" -gt 0 ]; then echo "resets:  $RESET_COUNT available (no details returned)"
+    else echo "resets:  0 available"; fi
+    return 0
+  fi
+
+  echo "resets:  $RESET_COUNT available"
+  mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -n)
+  for row in "${sorted[@]}"; do
+    IFS="$sep" read -r key id st exp title <<< "$row"
+    n=$((n + 1))
+    if [ "$st" = available ]; then avail=$((avail + 1)); [ -n "$RESET_NEXT_ID" ] || RESET_NEXT_ID="$id"; fi
+    printf '         %s. %s  ' "$n" "$title"
+    case "$exp" in ''|null) printf 'no expiry' ;; *) printf 'expires '; fmt_time "@$exp" ;; esac
+    printf '  id=%s' "$id"; [ "$st" = available ] || printf '  (%s)' "$st"; printf '\n'
+  done
+
+  types="${rc//"$rt"/}"; types=$(( (${#rc} - ${#types}) / ${#rt} ))   # occurrences of "resetType"
+  if [ "$complete" -eq 0 ] || [ "$n" -ne "$types" ] || [ "$avail" -ne "$RESET_COUNT" ]; then
+    RESET_NEXT_ID=""
+    echo "         ($avail of $RESET_COUNT listed or parsed; the server picks which credit to use)"
+  fi
+}
+
+# use_reset -> spends RESET_NEXT_ID (or lets the backend pick) and prints the "reset:" line.
+use_reset() {
+  local params outcome
+  if [ "$RESET_COUNT" -le 0 ]; then echo "reset:   not used, no reset credits available"; return 1; fi
+  params="\"idempotencyKey\":\"$(new_uuid)\""
+  [ -z "$RESET_NEXT_ID" ] || params="\"creditId\":\"$RESET_NEXT_ID\",$params"
+  if ! app_call account/rateLimitResetCredit/consume "{$params}"; then
+    echo "reset:   failed: $RPC_ERROR"; return 1
+  fi
+  jv "$RPC_LINE" outcome; outcome="$JV"
+  case "$outcome" in
+    reset)           echo "reset:   done, used ${RESET_NEXT_ID:-the next available credit}" ;;
+    alreadyRedeemed) echo "reset:   done (this attempt was already redeemed)" ;;
+    nothingToReset)  echo "reset:   not used, no current rate-limit window is eligible for a reset"; return 1 ;;
+    noCredit)        echo "reset:   not used, the account has no reset credits"; return 1 ;;
+    *)               echo "reset:   unexpected outcome: ${outcome:-none} ($RPC_LINE)"; return 1 ;;
+  esac
+}
+
+run_live() {   # run_live [ROLLOUT_FILE]
+  if ! app_open || ! app_call account/rateLimits/read null; then
+    print_recorded_limits "${1-}"
+    echo "resets:  unavailable: $RPC_ERROR"
+    app_close; return 1
+  fi
+  print_live_limits "$RPC_LINE"
+  print_resets "$RPC_LINE"
+  [ "$USE_RESET" -eq 1 ] || { app_close; return 0; }
+
+  local rc=0
+  use_reset || rc=$?
+  if app_call account/rateLimits/read null; then
+    print_live_limits "$RPC_LINE" "after reset,"
+    print_resets "$RPC_LINE"
+  else
+    echo "limits:  re-read failed: $RPC_ERROR"
+  fi
+  app_close; return "$rc"
 }
 
 cleanup() {

@@ -20,6 +20,8 @@ Wrapper script (bash — run it with the Bash tool; `--help` lists every option)
 | `delegate` | user asks Codex to implement / modify something | workspace-write | edits land on disk immediately; approvals go through Codex automatic review. |
 | `resume` | follow-up on a previous Codex session | `--mode read-only` (default) or `--mode workspace-write` | `--last`, or the UUID from the `session:` line (nothing else is accepted). |
 | `status` | user asks about Codex's setup, model, login, rate-limit / token usage, or what a session ran with | none (offline; reads `$CODEX_HOME`, default `~/.codex`; no API call) | header only, or add `--last` (newest session in `-C DIR`) / SESSION_ID for that session's model, sandbox, approval and token totals. Not for `-m` / `--effort`. |
+| `status --resets` | user asks about current/live usage or rate-limit reset credits ("초기화권", "리셋 몇 개 남았어") | read-only API call (`codex app-server`) | live limits plus each reset credit with its expiry, soonest first. Combines with `--last` / SESSION_ID. |
+| `status --use-reset` | user explicitly asks to use a reset credit ("초기화권 써줘") | **spends a credit — irreversible** | shows the live state, consumes the soonest-expiring credit, then shows usage and credits again. See rule 10. |
 
 Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|…` (passed through unvalidated to Codex's `model_reasoning_effort`).
 
@@ -40,6 +42,7 @@ Shared options: `-C DIR` (project root), `-m MODEL`, `--effort low|medium|high|�
 7. **Never** edit the wrapper to add `--dangerously-*` flags, and never call `codex` directly with them.
 8. **Codex never commits; Claude does, after review.** Every `delegate` / `resume --mode workspace-write` prompt ends with "Do not commit." Claude commits after reviewing the diff, following the user's and the project's commit conventions (including any rules on AI attribution). If HEAD moved during the run (compare with the value recorded in rule 4), inspect `git log <before>..HEAD`; only when every commit in that range is Codex's (made during the run, touching its task) undo them with `git reset --soft <before>` (changes stay staged), review, then commit yourself. Anything else in that range — ask the user.
 9. **Read-only modes run Codex in a real sandbox** (`ask`, `review`, `resume` without `--mode workspace-write`): writes are refused at the OS level, shell commands have **no network access** (`curl`, `pip install`, `git fetch` fail) — web search still works (`--search` on every call; the tool runs on OpenAI's side) — and `approval_policy=never` means Codex cannot ask for an escalation. On Windows the wrapper enables Codex's Windows sandbox backend per call (`unelevated`); `CODEX_RUN_WINDOWS_SANDBOX=elevated` selects the elevated backend if the user has set it up.
+10. **Reset credits are spent only on the user's explicit go-ahead.** Run `status --resets` first and show the user the live usage and credits (count, soonest expiry). Then run `status --use-reset` only after they confirm in chat for this specific reset; a vague "check my limits" or a high usage reading is never a reason to spend one on your own. Run it once: a re-run is a new attempt that can spend another credit. `nothingToReset` means no window was eligible; report it rather than retrying.
 
 ## Writing the prompt
 
@@ -72,6 +75,7 @@ session: <id>
 - `session:` appears only when the run emitted a `thread.started` event; use it with `resume <id>`. Never printed by `review` (Codex's review text follows the header as-is) or `status`.
 - The trailer appears only for `delegate` / `resume --mode workspace-write` inside a git work tree.
 - `status` has its own layout: codex version/login, config.toml model/effort/reviewer, the wrapper's policy, `limits:` (the last rate-limit reading Codex recorded — not live — with its timestamp and source session; if the requested session recorded none, the newest session that did is shown), then with `--last`/SESSION_ID that session's model/sandbox/approval and token totals.
+- `status --resets` replaces that `limits:` line with the live one (`live (account/rateLimits/read)` under it) and adds `resets:  N available` with one numbered row per credit: title, `expires <time>`, `id=`. A trailing `(N of M listed or parsed; the server picks which credit to use)` means the list was incomplete, so `--use-reset` lets the server choose instead of the soonest row shown. If the live read fails, the recorded `limits:` line is shown with `resets:  unavailable: <reason>` and exit 1. `--use-reset` adds `reset:   done, used <id>` (or `not used, <reason>`, exit 1) followed by the re-read `limits:` (`after reset, live …`) and `resets:` lines.
 
 Failures: argument errors exit 1 and a missing `codex` exits 2 before Codex runs. When Codex itself fails, the wrapper exits with Codex's code and prints the last 20 lines of its stderr, `--- partial output ---` if a partial message exists, and `codex-run: events log kept at <path>` (`ask`/`delegate`/`resume`, only if the log is non-empty — an empty log is deleted without a message). `resume <SESSION_ID>` that started a different thread exits 1 with "session was NOT resumed" — checked after the run, so a write-mode follow-up may already have changed files; no `thread.started` event at all is only a warning. `CODEX_RUN_KEEP_LOG=1` keeps the log on success too.
 
@@ -106,6 +110,12 @@ EOF
 Codex setup and remaining rate limit, plus what the last session in this repo used:
 ```bash
 ~/.claude/skills/codex/scripts/codex-run.sh status -C "D:/Code Projects/x" --last
+```
+
+Live usage and reset credits, then (after the user confirms, rule 10) spend one:
+```bash
+~/.claude/skills/codex/scripts/codex-run.sh status --resets
+~/.claude/skills/codex/scripts/codex-run.sh status --use-reset
 ```
 
 Follow-up on that session (read-only):

@@ -29,10 +29,10 @@ Write-mode options: `--verify CMD` (`delegate`, `resume --mode workspace-write`)
 
 ## Rules
 
-1. **Always pass `-C` with the absolute project path** (forward slashes, e.g. `-C "D:/Code Projects/x"`). The wrapper `cd`s there; `resume --last` is scoped to that directory.
+1. **Always pass `-C` with the absolute project path** (e.g. `-C "/path/to/project"`; on Windows use forward slashes, e.g. `-C "C:/src/project"`). The wrapper `cd`s there; `resume --last` is scoped to that directory.
 2. **`ask` / `delegate` / `resume`: feed the prompt on stdin with a quoted heredoc** — no shell-quoting problems, multi-line friendly:
    ```bash
-   ~/.claude/skills/codex/scripts/codex-run.sh ask -C "D:/Code Projects/x" <<'EOF'
+   ~/.claude/skills/codex/scripts/codex-run.sh ask -C "/path/to/project" <<'EOF'
    ...prompt...
    EOF
    ```
@@ -95,7 +95,7 @@ Failures: argument errors exit 1 and a missing `codex` exits 2 before Codex runs
 
 Second opinion on a design:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh ask -C "D:/Code Projects/x" --effort high <<'EOF'
+~/.claude/skills/codex/scripts/codex-run.sh ask -C "/path/to/project" --effort high <<'EOF'
 Goal: assess the risks of moving session storage from Redis to Postgres.
 Read src/session/ and its tests. Sessions expire by TTL and several app instances share the store; both must keep working.
 Do not modify files or install anything; analysis only.
@@ -105,12 +105,12 @@ EOF
 
 Built-in review of uncommitted changes:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh review -C "D:/Code Projects/x" --uncommitted
+~/.claude/skills/codex/scripts/codex-run.sh review -C "/path/to/project" --uncommitted
 ```
 
 Delegate a task, then verify (rule 4):
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh delegate -C "D:/Code Projects/x" --verify "npm test" <<'EOF'
+~/.claude/skills/codex/scripts/codex-run.sh delegate -C "/path/to/project" --verify "npm test" <<'EOF'
 Add input validation to POST /users in src/routes/users.ts.
 Done when a missing, empty or whitespace-only name returns 400 in the existing error-response shape and valid input behaves as before.
 Add a test next to the existing route tests. Keep the current uncommitted changes; no new dependencies. Do not commit.
@@ -121,7 +121,7 @@ EOF
 
 Codex setup and remaining rate limit, plus what the last session in this repo used:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh status -C "D:/Code Projects/x" --last
+~/.claude/skills/codex/scripts/codex-run.sh status -C "/path/to/project" --last
 ```
 
 Live usage and reset credits, then (after the user confirms, rule 10) spend one:
@@ -132,7 +132,7 @@ Live usage and reset credits, then (after the user confirms, rule 10) spend one:
 
 Follow-up on that session (read-only):
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh resume -C "D:/Code Projects/x" <session-id> <<'EOF'
+~/.claude/skills/codex/scripts/codex-run.sh resume -C "/path/to/project" <session-id> <<'EOF'
 Why did you choose a regex over a schema library?
 EOF
 ```

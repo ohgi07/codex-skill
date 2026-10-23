@@ -10,6 +10,7 @@ rm -rf "$WORK"; mkdir -p "$WORK/bin" "$WORK/tmp"
 cp "$HERE/fake-codex" "$WORK/bin/codex"; chmod +x "$WORK/bin/codex"
 export PATH="$WORK/bin:$PATH"
 export TMPDIR="$WORK/tmp"
+export CODEX_RUN_USAGE_LIMIT=off   # the guard reads the real ~/.codex; tests that cover it set a limit and a fixture CODEX_HOME
 export FAKE_CODEX_ARGS="$WORK/args"
 export FAKE_CODEX_STDIN="$WORK/stdin"
 
@@ -23,7 +24,7 @@ has_arg()  { grep -qx -- "$1" "$FAKE_CODEX_ARGS"; }
 args_str() { local a=(); [ -f "$FAKE_CODEX_ARGS" ] && mapfile -t a < "$FAKE_CODEX_ARGS"; [ ${#a[@]} -eq 0 ] || printf '%s ' "${a[@]}"; }
 reset_fake() {
   rm -f "$FAKE_CODEX_ARGS" "$FAKE_CODEX_STDIN"
-  unset FAKE_CODEX_THREAD FAKE_CODEX_MSG FAKE_CODEX_RC FAKE_CODEX_TOUCH CODEX_RUN_KEEP_LOG
+  unset FAKE_CODEX_THREAD FAKE_CODEX_MSG FAKE_CODEX_RC FAKE_CODEX_TOUCH FAKE_CODEX_EVAL CODEX_RUN_KEEP_LOG
 }
 # run_wrapper ARGS... : runs the wrapper; sets RC, OUT (stdout), ERR (stderr). stdin is inherited.
 run_wrapper() {
@@ -512,6 +513,174 @@ assert_contains "resume --use-reset -> message" "$ERR" "only valid for status"
 reset_app
 unset FAKE_APP_LOG
 unset CODEX_HOME
+
+# ---------------------------------------------------------------- change report / --verify
+GIT=(git -c user.name=t -c user.email=t@t)
+mk_repo() {   # a.txt committed, b.txt committed then modified (pre-existing change)
+  REPO="$WORK/report-repo"; rm -rf "$REPO"; mkdir -p "$REPO"
+  git -C "$REPO" init -q
+  printf 'one\n' > "$REPO/a.txt"; printf 'one\n' > "$REPO/b.txt"
+  "${GIT[@]}" -C "$REPO" add . && "${GIT[@]}" -C "$REPO" commit -q -m init
+  printf 'two\n' >> "$REPO/b.txt"
+}
+mk_repo
+reset_fake; FAKE_CODEX_EVAL='printf "more\n" >> a.txt; printf "x\ny\n" > new.txt' run_wrapper delegate -C "$REPO" "edit"
+assert_eq "report -> rc 0" "$RC" 0
+assert_contains "report -> header" "$OUT" "--- codex-run verification ---"
+assert_contains "report -> two files touched" "$OUT" "files touched by Codex: 2"
+assert_contains "report -> pre-existing change left alone" "$OUT" "left alone: 1"
+assert_contains "report -> modified file with numstat" "$OUT" " M a.txt   (+1 -0)"
+assert_contains "report -> new file with line count" "$OUT" "?? new.txt   (new file, 2 lines; read it)"
+assert_not_contains "report -> pre-existing b.txt not attributed to Codex" "$OUT" "  M b.txt   ("
+assert_contains "report -> no warnings" "$OUT" "  (none)"
+
+reset_fake; FAKE_CODEX_EVAL='printf "more\n" >> b.txt' run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> touching a pre-existing dirty file is flagged" "$OUT" "[had changes before the run"
+
+mk_repo
+reset_fake; FAKE_CODEX_EVAL='rm a.txt' run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> deleted tracked file" "$OUT" "files touched by Codex: 1"
+assert_contains "report -> deleted file listed" "$OUT" " D a.txt"
+
+mk_repo
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> nothing changed warns" "$OUT" "no files changed"
+
+reset_fake; FAKE_CODEX_MSG="I could not run the tests (sandbox)" run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> message signal" "$OUT" "message says: I could not run the tests (sandbox)"
+
+reset_fake; FAKE_CODEX_EVAL=': > "$out"' run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> empty message warns" "$OUT" "final message is empty"
+
+mk_repo
+reset_fake; FAKE_CODEX_EVAL='printf "z\n" > c.txt; git add c.txt; git -c user.name=t -c user.email=t@t commit -q -m sneaky' run_wrapper delegate -C "$REPO" "edit"
+assert_contains "report -> HEAD moved" "$OUT" "HEAD moved:"
+assert_contains "report -> HEAD moved lists commit" "$OUT" "sneaky"
+assert_contains "report -> HEAD moved warns" "$OUT" "Codex committed despite"
+assert_not_contains "report -> committed work is not 'no files changed'" "$OUT" "no files changed"
+
+mk_repo
+reset_fake; FAKE_CODEX_EVAL='printf "a
+b
+c
+" > "한글 파일.txt"; mkdir sub && git -C sub init -q && printf "x
+" > sub/f && printf "m
+" >> a.txt' run_wrapper delegate -C "$REPO" "edit"
+assert_eq "report -> unreadable/odd untracked entries do not break it -> rc 0" "$RC" 0
+assert_contains "report -> non-ASCII name shown, not quoted" "$OUT" "한글 파일.txt   (new file, 3 lines; read it)"
+assert_contains "report -> numstat still found after odd entries" "$OUT" " M a.txt   (+1 -0)"
+
+mk_repo
+reset_fake; FAKE_CODEX_RC=1 FAKE_CODEX_EVAL='printf "half\n" > half.txt' run_wrapper delegate -C "$REPO" "edit"
+assert_eq "report on failure -> rc passes through" "$RC" 1
+assert_contains "report on failure -> still printed" "$OUT" "?? half.txt"
+assert_contains "report on failure -> warns" "$OUT" "Codex exited with status 1"
+
+reset_fake; run_wrapper resume --last -C "$REPO" --mode workspace-write "go"
+assert_contains "report -> resume workspace-write" "$OUT" "--- codex-run verification ---"
+reset_fake; run_wrapper resume --last -C "$REPO" "go"
+assert_not_contains "report -> not for read-only resume" "$OUT" "codex-run verification"
+reset_fake; run_wrapper ask -C "$REPO" "q"
+assert_not_contains "report -> not for ask" "$OUT" "codex-run verification"
+
+NOGIT="$(mktemp -d /tmp/codex-nogit.XXXXXX)"; printf 'old\n' > "$NOGIT/old.txt"; sleep 1
+reset_fake; FAKE_CODEX_EVAL='printf "n\n" > fresh.txt' run_wrapper delegate -C "$NOGIT" "x"
+assert_contains "report nogit -> says so" "$OUT" "not a git work tree: files modified since the run started: 1"
+assert_contains "report nogit -> lists new file" "$OUT" "  fresh.txt"
+assert_not_contains "report nogit -> old file not listed" "$OUT" "old.txt"
+assert_eq "report nogit -> marker file cleaned up" "$(find "$TMPDIR/codex-run" -name "marker.*" 2>/dev/null | wc -l | tr -d " ")" 0
+rm -rf "$NOGIT"
+
+mk_repo
+reset_fake; run_wrapper delegate -C "$REPO" --verify "echo all-green" "edit"
+assert_eq "verify pass -> rc 0" "$RC" 0
+assert_contains "verify pass -> PASSED" "$OUT" 'verify: PASSED  $ echo all-green'
+assert_contains "verify pass -> output shown" "$OUT" "    all-green"
+reset_fake; run_wrapper delegate -C "$REPO" --verify "echo boom; exit 3" "edit"
+assert_eq "verify fail -> rc 4" "$RC" 4
+assert_contains "verify fail -> FAILED with status" "$OUT" "verify: FAILED (exit 3)"
+assert_contains "verify fail -> output shown" "$OUT" "    boom"
+reset_fake; CODEX_RUN_VERIFY_TIMEOUT=1 run_wrapper delegate -C "$REPO" --verify "sleep 5" "edit"
+assert_eq "verify timeout -> rc 4" "$RC" 4
+assert_contains "verify timeout -> message" "$OUT" "verify: TIMED OUT after 1s"
+reset_fake; FAKE_CODEX_RC=1 run_wrapper delegate -C "$REPO" --verify "true" "edit"
+assert_contains "verify skipped when Codex failed" "$OUT" "verify: skipped (Codex failed)"
+reset_fake; run_wrapper delegate -C "$REPO" --verify "pwd" "edit"
+assert_contains "verify runs in DIR" "$OUT" "report-repo"
+reset_fake; run_wrapper ask -C "$REPO" --verify "true" "q"
+assert_eq "--verify on ask -> rc 1" "$RC" 1
+assert_contains "--verify on ask -> message" "$ERR" "--verify is only valid"
+reset_fake; run_wrapper resume --last -C "$REPO" --verify "true" "q"
+assert_eq "--verify on read-only resume -> rc 1" "$RC" 1
+assert_contains "--verify on read-only resume -> message" "$ERR" "--verify needs resume --mode workspace-write"
+reset_fake; run_wrapper delegate -C "$REPO" --verify
+assert_eq "--verify without command -> rc 1" "$RC" 1
+
+# ---------------------------------------------------------------- usage guard
+UCH="$WORK/usage-home"; rm -rf "$UCH"; mkdir -p "$UCH/sessions/2026/10/01"
+SID_U="dddddddd-0000-4000-8000-00000000000d"
+FUT='s/1789568043/4102444800/; s/1790088680/4102444800/'   # push both reset times far into the future
+mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "$SID_U" "$REPO_JSON" "m" "read-only" "never" \
+  "$(usage_json 10 5 5 1 85.0 40.0 plus | sed "$FUT")"
+export CODEX_HOME="$UCH"; export CODEX_RUN_USAGE_LIMIT=80
+
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: delegate at 85% -> rc 3" "$RC" 3
+assert_contains "guard: names the window" "$ERR" "5h window 85% used"
+assert_contains "guard: says nothing started" "$ERR" "nothing was started"
+assert_contains "guard: points to --ignore-usage" "$ERR" "--ignore-usage"
+[ ! -e "$FAKE_CODEX_ARGS" ] && ok "guard: codex not invoked" || fail "guard: codex not invoked"
+reset_fake; run_wrapper resume --last -C "$REPO" --mode workspace-write "go"
+assert_eq "guard: resume workspace-write -> rc 3" "$RC" 3
+reset_fake; run_wrapper ask -C "$REPO" --effort high "q"
+assert_eq "guard: ask --effort high -> rc 3" "$RC" 3
+reset_fake; run_wrapper review -C "$REPO" --effort max
+assert_eq "guard: review --effort max -> rc 3" "$RC" 3
+reset_fake; run_wrapper ask -C "$REPO" "q"
+assert_eq "guard: plain ask passes" "$RC" 0
+reset_fake; run_wrapper ask -C "$REPO" --effort medium "q"
+assert_eq "guard: ask --effort medium passes" "$RC" 0
+reset_fake; run_wrapper resume --last -C "$REPO" "q"
+assert_eq "guard: read-only resume passes" "$RC" 0
+reset_fake; run_wrapper delegate -C "$REPO" --ignore-usage "edit"
+assert_eq "guard: --ignore-usage passes" "$RC" 0
+reset_fake; CODEX_RUN_USAGE_LIMIT=90 run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: limit above reading passes" "$RC" 0
+reset_fake; CODEX_RUN_USAGE_LIMIT=85 run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: limit equal to reading blocks" "$RC" 3
+reset_fake; CODEX_RUN_USAGE_LIMIT=off run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: limit off passes" "$RC" 0
+reset_fake; CODEX_RUN_USAGE_LIMIT=lots run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: bad limit -> rc 1" "$RC" 1
+assert_contains "guard: bad limit -> message" "$ERR" "CODEX_RUN_USAGE_LIMIT must be"
+reset_fake; run_wrapper status
+assert_eq "guard: status unaffected" "$RC" 0
+reset_fake; run_wrapper status --ignore-usage
+assert_eq "--ignore-usage on status -> rc 1" "$RC" 1
+
+# the weekly window alone can trip it, and the worse one is named
+mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "$SID_U" "$REPO_JSON" "m" "read-only" "never" \
+  "$(usage_json 10 5 5 1 20.0 95.0 plus | sed "$FUT")"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: weekly window trips it" "$RC" 3
+assert_contains "guard: weekly window named" "$ERR" "weekly 95% used"
+
+# a missing window (null) must not abort the guard silently
+mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "$SID_U" "$REPO_JSON" "m" "read-only" "never"   "$(usage_json 10 5 5 1 90.0 40.0 plus | sed "$FUT; s/\"secondary\":{[^}]*}/\"secondary\":null/")"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: null secondary window still reports -> rc 3" "$RC" 3
+assert_contains "guard: null secondary -> message" "$ERR" "5h window 90% used"
+
+# a window whose reset time has passed is stale and ignored (fixture reset times are in the past)
+mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "$SID_U" "$REPO_JSON" "m" "read-only" "never" \
+  "$(usage_json 10 5 5 1 99.0 99.0 plus)"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: reading whose windows already reset passes" "$RC" 0
+
+rm -rf "$UCH/sessions"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: no recorded usage passes" "$RC" 0
+unset CODEX_HOME; export CODEX_RUN_USAGE_LIMIT=off
 
 # ---------------------------------------------------------------- SKILL.md
 SKILL="$HERE/../SKILL.md"

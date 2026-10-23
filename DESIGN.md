@@ -181,7 +181,33 @@ session: <thread id>          # parsed from the --json `thread.started` event; l
 
 - The trailer is deliberately named "git status after Codex": on an already
   dirty repo it cannot distinguish Codex's edits from pre-existing ones.
-  Claude is instructed to run `git diff` itself. No before/after snapshot logic.
+  Claude still runs `git diff` itself; the verification report below only
+  narrows down where to look.
+- After the trailer, write runs (delegate, resume `--mode workspace-write`)
+  print a `--- codex-run verification ---` report, also when Codex fails:
+  - Snapshot: before the run, every path `git status --porcelain -z` lists,
+    with its XY status and the `git hash-object` of the file on disk; after
+    the run the same. A path whose entry differs was touched by Codex; equal
+    entries are counted as "left alone". Outside git: files newer than a marker
+    file (no `.git`/`node_modules`, at most 200).
+  - HEAD before/after, with `git log` of any new commits (rule 8).
+  - Warnings: non-zero exit, no files changed, empty final message, and lines
+    of the final message matching "could not / skipped / failed / sandbox ..."
+    (a hint only, not a verdict).
+  - `--verify CMD` runs after a successful Codex run, in DIR, outside Codex's
+    sandbox, bounded by `CODEX_RUN_VERIFY_TIMEOUT` (600s). Failure or timeout
+    makes the wrapper exit 4; Codex's own failures keep Codex's exit code.
+
+## Usage guard
+
+`delegate`, `resume --mode workspace-write` and any run with `--effort
+high|xhigh|max` first read the last rate-limit reading Codex recorded in
+`$CODEX_HOME/sessions` (the same offline source as `status`). If a window is at
+or above `CODEX_RUN_USAGE_LIMIT` percent (default 80, `off` disables), the
+wrapper exits 3 before starting anything, so Claude can ask the user. A window
+whose `resets_at` is already past is skipped, since that reading is stale.
+`--ignore-usage` bypasses the check. The reading is not live; `status
+--resets` gives live numbers.
 - `review` has no `--json`/`-o`; its stdout is passed through unchanged after
   the header line.
 

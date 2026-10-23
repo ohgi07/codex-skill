@@ -3,8 +3,8 @@
 #
 #   codex-run.sh review   [-C DIR] [-m MODEL] [--effort X] [--uncommitted | --base BRANCH | --commit SHA]
 #   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
-#   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
-#   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+#   codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [--verify CMD] [--ignore-usage] [PROMPT | -]
+#   codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [--verify CMD] [PROMPT | -]
 #   codex-run.sh status   [-C DIR] [--last | SESSION_ID] [--resets | --use-reset]
 #
 # Sandbox invariants enforced here, not assumed from Codex defaults (verified against Codex 0.154.0):
@@ -24,8 +24,8 @@ usage() {
   printf '%s\n' "Usage:
   codex-run.sh review   [-C DIR] [-m MODEL] [--effort X] [--uncommitted | --base BRANCH | --commit SHA]
   codex-run.sh ask      [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
-  codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [PROMPT | -]
-  codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [PROMPT | -]
+  codex-run.sh delegate [-C DIR] [-m MODEL] [--effort X] [--verify CMD] [--ignore-usage] [PROMPT | -]
+  codex-run.sh resume   [-C DIR] [-m MODEL] [--effort X] (--last | SESSION_ID) [--mode read-only|workspace-write] [--verify CMD] [PROMPT | -]
   codex-run.sh status   [-C DIR] [--last | SESSION_ID] [--resets | --use-reset]
 
 Modes:
@@ -43,10 +43,19 @@ Modes:
             --use-reset  as --resets, then SPENDS one reset credit (the soonest to expire) to reset the
                          current usage windows, and reads usage again. Irreversible.
 
+Verification (delegate, resume --mode workspace-write): after the run a report lists the files Codex changed
+  (vs. changes already present), whether HEAD moved, warnings, and the result of --verify CMD, a command run in
+  DIR outside Codex's sandbox (exit status 4 if it fails or times out).
+Usage guard: delegate, resume --mode workspace-write and --effort high|xhigh|max stop with exit status 3 before
+  starting when the last recorded rate-limit reading is at or above CODEX_RUN_USAGE_LIMIT percent (default 80).
+  --ignore-usage skips the check.
+
 Web search: on in every mode (codex --search); sandboxed shell commands still have no network.
 
 Prompt: last positional argument, or \`-\` / omitted to read stdin (heredoc-friendly).
 Env:    CODEX_RUN_KEEP_LOG=1                keeps the raw JSONL event log even on success.
+        CODEX_RUN_USAGE_LIMIT=N|off         usage guard threshold in percent (default 80).
+        CODEX_RUN_VERIFY_TIMEOUT=SECONDS    limit for the --verify command (default 600).
         CODEX_RUN_WINDOWS_SANDBOX=elevated  (Windows only) use Codex's elevated sandbox backend instead of
                                             the default \"unelevated\" restricted-token one."
 }
@@ -96,6 +105,7 @@ parse_args() {
   REVIEW_TARGET=(); local target_count=0
   RESUME_LAST=0; SESSION_ID=""; RESUME_MODE="read-only"
   LIVE=0; USE_RESET=0
+  VERIFY_CMD=""; IGNORE_USAGE=0
   PROMPT_ARG=""
   local -a pos=()
 
@@ -124,6 +134,13 @@ parse_args() {
         [ "$MODE" = resume ] || die "--mode is only valid for resume"
         { [ $# -ge 2 ] && case "$2" in -*) false;; esac; } || die "--mode needs a value"
         RESUME_MODE="$2"; shift 2 ;;
+      --verify)
+        case "$MODE" in delegate|resume) ;; *) die "--verify is only valid for delegate or resume --mode workspace-write" ;; esac
+        { [ $# -ge 2 ] && [ -n "$2" ]; } || die "--verify needs a command"
+        VERIFY_CMD="$2"; shift 2 ;;
+      --ignore-usage)
+        [ "$MODE" != status ] || die "--ignore-usage is not valid for status"
+        IGNORE_USAGE=1; shift ;;
       --resets)
         [ "$MODE" = status ] || die "--resets is only valid for status"
         LIVE=1; shift ;;
@@ -148,6 +165,7 @@ parse_args() {
       ;;
     resume)
       case "$RESUME_MODE" in read-only|workspace-write) ;; *) die "--mode must be read-only or workspace-write" ;; esac
+      [ -z "$VERIFY_CMD" ] || [ "$RESUME_MODE" = workspace-write ] || die "--verify needs resume --mode workspace-write"
       if [ "$RESUME_LAST" -eq 1 ]; then
         [ "${#pos[@]}" -le 1 ] || die "unexpected extra argument: ${pos[1]}"
         looks_like_uuid "${pos[0]-}" && die "pass either --last or SESSION_ID, not both"
@@ -239,11 +257,190 @@ report_failure() {
   fi
 }
 
+# ---------------------------------------------------------------- usage guard
+# Heavy runs (delegate, resume --mode workspace-write, --effort high|xhigh|max) are refused up front when the
+# last rate-limit reading Codex recorded is at or above CODEX_RUN_USAGE_LIMIT percent (default 80; "off"
+# disables). A window whose reset time has already passed is skipped: that reading is stale. The reading is
+# the offline one `status` prints, not live; --ignore-usage skips the check. Exit status 3, nothing started.
+
+is_heavy_run() {
+  is_write_run && return 0
+  case "$EFFORT" in high|xhigh|max) return 0 ;; esac
+  return 1
+}
+
+usage_guard() {
+  [ "$IGNORE_USAGE" -eq 0 ] || return 0
+  local limit="${CODEX_RUN_USAGE_LIMIT:-80}"
+  case "$limit" in
+    off) return 0 ;;
+    ''|*[!0-9]*) die "CODEX_RUN_USAGE_LIMIT must be a number or off (got: $limit)" ;;
+  esac
+  is_heavy_run || return 0
+
+  CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  local f line rl key now hit="" worst=-1 p r
+  f="$(newest_usage)"; [ -n "$f" ] || return 0
+  line="$(last_token_count "$f")"
+  rl="${line#*\"rate_limits\":}"
+  printf -v now '%(%s)T' -1
+  for key in primary secondary; do
+    first_object "$rl" "$key"; [ -n "$OBJ" ] || continue
+    jv "$OBJ" used_percent; p="${JV%%.*}"; jv "$OBJ" resets_at; r="$JV"
+    [[ $p =~ ^[0-9]+$ && $r =~ ^[0-9]+$ ]] || continue
+    [ "$r" -gt "$now" ] || continue
+    if [ "$p" -ge "$limit" ] && [ "$p" -gt "$worst" ]; then
+      worst="$p"; hit="$(print_window "$OBJ" window_minutes used_percent resets_at)"
+    fi
+  done
+  [ -n "$hit" ] || return 0
+
+  jv "$line" timestamp
+  echo "codex-run: usage guard: ${hit#  } (limit ${limit}%; last recorded reading, $(fmt_time "$JV"))" >&2
+  echo "codex-run: nothing was started. Tell the user, then re-run with --ignore-usage to proceed (live numbers: status --resets)." >&2
+  exit 3
+}
+
+# ---------------------------------------------------------------- change report (delegate / resume workspace-write)
+# A before/after snapshot of the work tree tells Codex's edits apart from changes that were already there.
+# In a git repo: every path `git status` lists, with its XY status and the content hash of the file on disk.
+# Outside git: files newer than a marker file. After the run the report lists what changed, whether HEAD moved,
+# phrases in Codex's message that signal incomplete work, and the result of the optional --verify command.
+
+declare -A SNAP_BEFORE=() SNAP_AFTER=()
+GIT_TOP=""; HEAD_BEFORE=""; MARKER=""
+
+is_write_run() {
+  [ "$MODE" = delegate ] || { [ "$MODE" = resume ] && [ "$RESUME_MODE" = workspace-write ]; }
+}
+
+# snap_tree ARRAY_NAME -> fills the (global, associative) array: path -> "XY<space>hash".
+snap_tree() {
+  local -n _snap="$1"; _snap=()
+  local entry xy skip=0 i j
+  local -a paths=() xys=() exist=() hashes=()
+  while IFS= read -r -d '' entry; do
+    if [ "$skip" -eq 1 ]; then skip=0; continue; fi   # rename/copy: the next record is the origin path
+    xy="${entry:0:2}"
+    case "$xy" in *R*|*C*) skip=1 ;; esac
+    xys+=("$xy"); paths+=("${entry:3}")
+  done < <(git -C "$GIT_TOP" status --porcelain=v1 -z --untracked-files=all 2>/dev/null)
+  for i in "${!paths[@]}"; do
+    [ -f "$GIT_TOP/${paths[i]}" ] && exist+=("${paths[i]}")
+  done
+  if [ "${#exist[@]}" -gt 0 ]; then
+    mapfile -t hashes < <(printf '%s\n' "${exist[@]}" | git -C "$GIT_TOP" hash-object --no-filters --stdin-paths 2>/dev/null)
+  fi
+  j=0
+  for i in "${!paths[@]}"; do
+    if [ -f "$GIT_TOP/${paths[i]}" ]; then _snap["${paths[i]}"]="${xys[i]} ${hashes[j]-?}"; j=$((j + 1))
+    else _snap["${paths[i]}"]="${xys[i]} -"; fi
+  done
+}
+
+snapshot_before() {
+  is_write_run || return 0
+  if GIT_TOP="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    HEAD_BEFORE="$(git rev-parse --verify -q HEAD 2>/dev/null || true)"
+    snap_tree SNAP_BEFORE
+  else
+    GIT_TOP=""
+    MARKER="$(mktemp "$(dirname "$LOG")/marker.XXXXXX")"
+  fi
+}
+
+# report_warn TEXT -> one "  - TEXT" line; counts toward the summary.
+report_warn() { echo "  - $1"; REPORT_WARNS=$((REPORT_WARNS + 1)); }
+
+# message_signals -> up to 5 lines of Codex's final message that read like incomplete work.
+message_signals() {
+  [ -s "$OUT_FILE" ] || return 0
+  grep -iE "could not|couldn't|cannot|can't|unable to|skipped|not run|did not run|failed|blocked|sandbox|못했|못 |불가|실패|건너|생략" "$OUT_FILE" 2>/dev/null \
+    | cut -c1-160 | head -n 5 || true
+}
+
+print_change_report() {   # print_change_report RUN_RC
+  local rc="$1" p b a label n numstat added deleted head_after touched=0 untouched=0 line
+  local -a all=() changed=()
+  local -A stat=()
+  REPORT_WARNS=0
+  echo; echo "--- codex-run verification ---"
+
+  if [ -n "$GIT_TOP" ]; then
+    snap_tree SNAP_AFTER
+    while IFS= read -r p; do [ -z "$p" ] || all+=("$p"); done < <(printf '%s\n' "${!SNAP_BEFORE[@]}" "${!SNAP_AFTER[@]}" | sort -u)
+    for p in "${all[@]}"; do
+      if [ "${SNAP_BEFORE[$p]-}" != "${SNAP_AFTER[$p]-}" ]; then changed+=("$p"); else untouched=$((untouched + 1)); fi
+    done
+    if [ "${#changed[@]}" -gt 0 ]; then
+      while IFS=$'\t' read -r added deleted p; do stat["$p"]="+$added -$deleted"; done \
+        < <(git -C "$GIT_TOP" -c core.quotepath=off diff HEAD --numstat -- "${changed[@]}" 2>/dev/null || true)
+    fi
+    touched="${#changed[@]}"
+    echo "files touched by Codex: $touched   (changes already present before the run and left alone: $untouched)"
+    for p in "${changed[@]}"; do
+      a="${SNAP_AFTER[$p]-}"; b="${SNAP_BEFORE[$p]-}"
+      if [ -z "$a" ]; then label="clean  "; else label="${a:0:2} "; fi
+      line="  $label$p"
+      case "$a" in
+        '??'*) n=""; if [ -f "$GIT_TOP/$p" ]; then n="$(wc -l < "$GIT_TOP/$p" 2>/dev/null | tr -d ' ')" || n=""; fi; line="$line   (new file, ${n:-?} lines; read it)" ;;
+        *) [ -z "${stat[$p]-}" ] || line="$line   (${stat[$p]})" ;;
+      esac
+      [ -z "$b" ] || line="$line   [had changes before the run; the numbers include them]"
+      echo "$line"
+    done
+    head_after="$(git rev-parse --verify -q HEAD 2>/dev/null || true)"
+    if [ "$head_after" != "$HEAD_BEFORE" ]; then
+      echo "HEAD moved: ${HEAD_BEFORE:-(none)} -> ${head_after:-(none)}"
+      [ -z "$HEAD_BEFORE" ] || git -C "$GIT_TOP" log --oneline "$HEAD_BEFORE..HEAD" 2>/dev/null | sed 's/^/    /' || true
+    fi
+  else
+    mapfile -t changed < <(find . \( -name .git -o -name node_modules \) -prune -o -type f -newer "$MARKER" -print 2>/dev/null | sort | head -n 200)
+    touched="${#changed[@]}"
+    echo "not a git work tree: files modified since the run started: $touched"
+    for p in "${changed[@]}"; do echo "  ${p#./}"; done
+  fi
+
+  echo "warnings:"
+  if [ "$rc" -ne 0 ]; then report_warn "Codex exited with status $rc; the files above may be half-done and nothing was rolled back"; fi
+  if [ "$touched" -eq 0 ] && [ "$rc" -eq 0 ] && [ "${head_after-}" = "$HEAD_BEFORE" ]; then report_warn "no files changed"; fi
+  if [ -n "$GIT_TOP" ] && [ "$head_after" != "$HEAD_BEFORE" ]; then report_warn "HEAD moved: Codex committed despite 'Do not commit' (see SKILL.md rule 8)"; fi
+  if [ "$rc" -eq 0 ] && [ ! -s "$OUT_FILE" ]; then report_warn "Codex's final message is empty"; fi
+  while IFS= read -r line; do [ -z "$line" ] || report_warn "message says: $line"; done < <(message_signals)
+  [ "$REPORT_WARNS" -gt 0 ] || echo "  (none)"
+
+  if [ -n "$VERIFY_CMD" ] && [ "$rc" -eq 0 ]; then run_verify; else
+    [ -z "$VERIFY_CMD" ] || echo "verify: skipped (Codex failed)"
+  fi
+}
+
+# run_verify -> runs --verify CMD in DIR (outside Codex's sandbox, with this shell's permissions) and prints its
+# exit status and last 20 output lines. Sets VERIFY_RC; CODEX_RUN_VERIFY_TIMEOUT seconds (default 600).
+run_verify() {
+  local vout; vout="$(mktemp "$(dirname "$LOG")/verify.XXXXXX")"
+  VERIFY_RC=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 5 "${CODEX_RUN_VERIFY_TIMEOUT:-600}" bash -c "$VERIFY_CMD" </dev/null >"$vout" 2>&1 || VERIFY_RC=$?
+  else
+    bash -c "$VERIFY_CMD" </dev/null >"$vout" 2>&1 || VERIFY_RC=$?
+  fi
+  if [ "$VERIFY_RC" -eq 0 ]; then echo "verify: PASSED  \$ $VERIFY_CMD"
+  elif [ "$VERIFY_RC" -eq 124 ] || [ "$VERIFY_RC" -eq 137 ]; then echo "verify: TIMED OUT after ${CODEX_RUN_VERIFY_TIMEOUT:-600}s  \$ $VERIFY_CMD"
+  else echo "verify: FAILED (exit $VERIFY_RC)  \$ $VERIFY_CMD"; fi
+  if [ -s "$vout" ]; then echo "  last output lines:"; tail -n 20 "$vout" | sed 's/^/    /'; fi
+  rm -f "$vout"
+}
+
 # Executes CMD for ask/delegate/resume. Prompt from $PROMPT on stdin. Returns codex's exit code.
 run_json_mode() {
   local rc=0
+  snapshot_before
   printf '%s' "$PROMPT" | "${CMD[@]}" >"$LOG" 2>"$ERR_FILE" || rc=$?
-  if [ "$rc" -ne 0 ]; then report_failure "$rc"; return "$rc"; fi
+  if [ "$rc" -ne 0 ]; then
+    report_failure "$rc"
+    ! is_write_run || print_change_report "$rc"
+    return "$rc"
+  fi
 
   local tid; tid="$(extract_thread_id "$LOG")"
   if [ "$MODE" = resume ] && [ -n "$SESSION_ID" ]; then
@@ -259,9 +456,12 @@ run_json_mode() {
   echo
   if [ -s "$OUT_FILE" ]; then cat "$OUT_FILE"; echo; fi
 
-  if { [ "$MODE" = delegate ] || { [ "$MODE" = resume ] && [ "$RESUME_MODE" = workspace-write ]; }; } \
-     && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if is_write_run && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo; echo "--- git status after Codex ---"; git status --short
+  fi
+  if is_write_run; then
+    print_change_report 0
+    [ "${VERIFY_RC:-0}" -eq 0 ] || return 4
   fi
   return 0
 }
@@ -320,7 +520,7 @@ print_window() {
 # first_object JSON KEY -> OBJ = the first brace-free {...} value of "KEY", or empty.
 first_object() {
   local re="\"$2\":[{][^}]*[}]"
-  OBJ=""; [[ $1 =~ $re ]] && OBJ="${BASH_REMATCH[0]}"
+  OBJ=""; if [[ $1 =~ $re ]]; then OBJ="${BASH_REMATCH[0]}"; fi   # always succeeds: callers run under set -e
 }
 
 # norm_path PATH -> lowercase, forward slashes, no trailing slash (Codex records cwd as C:\\Users\\... on Windows).
@@ -655,7 +855,7 @@ cleanup() {
   else
     rm -f "$LOG"
   fi
-  rm -f "$OUT_FILE" "$ERR_FILE"
+  rm -f "$OUT_FILE" "$ERR_FILE" "$MARKER"
 }
 
 main() {
@@ -671,6 +871,7 @@ main() {
   unset CDPATH
   cd -- "$DIR"
   if [ "$MODE" = status ]; then run_status; return; fi
+  usage_guard
 
   local tmproot="${TMPDIR:-/tmp}/codex-run"
   mkdir -p "$tmproot"

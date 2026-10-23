@@ -70,6 +70,9 @@ if [ -n "${FAKE_CODEX_TOUCH:-}" ]; then
   : > "$FAKE_CODEX_TOUCH"
 fi
 
+# FAKE_CODEX_EVAL: shell snippet run in the wrapper-chosen cwd, for edits a test wants Codex to "make".
+[ -z "${FAKE_CODEX_EVAL:-}" ] || eval "$FAKE_CODEX_EVAL"
+
 if printf '%s\n' "$@" | grep -qx -- '--json'; then
   printf '{"type":"thread.started","thread_id":"%s"}\n' "${FAKE_CODEX_THREAD-fake-thread-1}"
   printf '{"type":"turn.completed","usage":{}}\n'

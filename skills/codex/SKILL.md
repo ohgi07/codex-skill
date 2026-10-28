@@ -8,8 +8,10 @@ description: Use when the user names Codex — "codex", "코덱스", "codex 리�
 Wrapper script (bash — run it with the Bash tool; `--help` lists every option):
 
 ```
-~/.claude/skills/codex/scripts/codex-run.sh <mode> [-C DIR] [options] [PROMPT | -]
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" <mode> [-C DIR] [options] [PROMPT | -]
 ```
+
+`scripts/` sits next to this SKILL.md. If the path above did not come out as an absolute path, use this skill's base directory (shown when the skill loaded) in its place.
 
 ## Modes
 
@@ -32,7 +34,7 @@ Write-mode options: `--verify CMD` (`delegate`, `resume --mode workspace-write`)
 1. **Always pass `-C` with the absolute project path** (e.g. `-C "/path/to/project"`; on Windows use forward slashes, e.g. `-C "C:/src/project"`). The wrapper `cd`s there; `resume --last` is scoped to that directory.
 2. **`ask` / `delegate` / `resume`: feed the prompt on stdin with a quoted heredoc** — no shell-quoting problems, multi-line friendly:
    ```bash
-   ~/.claude/skills/codex/scripts/codex-run.sh ask -C "/path/to/project" <<'EOF'
+   "${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" ask -C "/path/to/project" <<'EOF'
    ...prompt...
    EOF
    ```
@@ -95,7 +97,7 @@ Failures: argument errors exit 1 and a missing `codex` exits 2 before Codex runs
 
 Second opinion on a design:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh ask -C "/path/to/project" --effort high <<'EOF'
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" ask -C "/path/to/project" --effort high <<'EOF'
 Goal: assess the risks of moving session storage from Redis to Postgres.
 Read src/session/ and its tests. Sessions expire by TTL and several app instances share the store; both must keep working.
 Do not modify files or install anything; analysis only.
@@ -105,12 +107,12 @@ EOF
 
 Built-in review of uncommitted changes:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh review -C "/path/to/project" --uncommitted
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" review -C "/path/to/project" --uncommitted
 ```
 
 Delegate a task, then verify (rule 4):
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh delegate -C "/path/to/project" --verify "npm test" <<'EOF'
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" delegate -C "/path/to/project" --verify "npm test" <<'EOF'
 Add input validation to POST /users in src/routes/users.ts.
 Done when a missing, empty or whitespace-only name returns 400 in the existing error-response shape and valid input behaves as before.
 Add a test next to the existing route tests. Keep the current uncommitted changes; no new dependencies. Do not commit.
@@ -121,18 +123,18 @@ EOF
 
 Codex setup and remaining rate limit, plus what the last session in this repo used:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh status -C "/path/to/project" --last
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" status -C "/path/to/project" --last
 ```
 
 Live usage and reset credits, then (after the user confirms, rule 10) spend one:
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh status --resets
-~/.claude/skills/codex/scripts/codex-run.sh status --use-reset
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" status --resets
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" status --use-reset
 ```
 
 Follow-up on that session (read-only):
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh resume -C "/path/to/project" <session-id> <<'EOF'
+"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh" resume -C "/path/to/project" <session-id> <<'EOF'
 Why did you choose a regex over a schema library?
 EOF
 ```

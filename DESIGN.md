@@ -26,18 +26,23 @@ Follow-up turns on a prior Codex session are supported via `resume`.
 ## Deliverables
 
 ```
-~/.claude/skills/codex/
-├── SKILL.md              # when/how Claude uses it
-├── scripts/codex-run.sh  # the wrapper (bash, Git Bash compatible)
-├── DESIGN.md              # copy of this spec, kept next to the skill
-├── tests/fake-codex       # test double for the `codex` CLI, used by test-unit.sh
-├── tests/test-unit.sh     # offline unit harness (no network; fake-codex on PATH)
-├── tests/test-smoke.sh    # hits the real Codex API on the user's account; not run in CI
-├── .gitattributes         # forces LF line endings for the shell scripts on Windows
-└── .gitignore             # excludes tests/.work and other per-run scratch (git-ignored)
+codex-skill/                          # the repo is a Claude Code plugin marketplace
+├── .claude-plugin/marketplace.json   # marketplace "codex-skill" listing one plugin, source "./"
+├── .claude-plugin/plugin.json        # plugin "codex"; skills live under ./skills/
+├── skills/codex/SKILL.md             # when/how Claude uses it
+├── skills/codex/scripts/codex-run.sh # the wrapper (bash, Git Bash compatible)
+├── DESIGN.md                         # this spec
+├── tests/fake-codex                  # test double for the `codex` CLI, used by test-unit.sh
+├── tests/test-unit.sh                # offline unit harness (no network; fake-codex on PATH)
+├── tests/test-smoke.sh               # hits the real Codex API on the user's account; not run in CI
+├── .gitattributes                    # forces LF line endings for the shell scripts on Windows
+└── .gitignore                        # excludes tests/.work and other per-run scratch (git-ignored)
 ```
 
-User-level install so it works in every project.
+Installed as a user-scope plugin so it works in every project. Claude Code copies
+the plugin into its own cache, so SKILL.md never hard-codes an install path: it
+calls the wrapper as `"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh"`, which Claude
+Code fills in with the skill's folder when the skill loads.
 
 ## Script interface
 

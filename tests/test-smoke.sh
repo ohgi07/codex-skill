@@ -3,7 +3,7 @@
 #   bash tests/test-smoke.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN="$HERE/../scripts/codex-run.sh"
+RUN="$HERE/../skills/codex/scripts/codex-run.sh"
 export TMPDIR="${TMPDIR:-$HERE/.work/smoke-tmp}"; mkdir -p "$TMPDIR"
 
 PASS=0; FAIL=0

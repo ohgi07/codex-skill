@@ -1,5 +1,5 @@
 # Bash scripts and the docs are LF-only; core.autocrlf=true would otherwise rewrite them to CRLF
-# on checkout and break `bash scripts/codex-run.sh`.
+# on checkout and break `bash skills/codex/scripts/codex-run.sh`.
 * text=auto eol=lf
 *.sh text eol=lf
 tests/fake-codex text eol=lf

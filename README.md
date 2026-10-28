@@ -31,7 +31,7 @@ What the wrapper adds on top of `codex exec`:
   totals of a past session from `~/.codex`; `status --resets` reads live limits and reset credits.
 - **No silent commits.** Delegated prompts end with "Do not commit"; Claude reviews the diff and commits itself.
 
-`SKILL.md` holds the rules Claude follows; `DESIGN.md` explains why the wrapper works the way it does.
+`skills/codex/SKILL.md` holds the rules Claude follows; `DESIGN.md` explains why the wrapper works the way it does.
 
 ## Requirements
 
@@ -45,25 +45,40 @@ have seen less testing.
 
 ## Install
 
-Clone into your user-level skills folder so it is available in every project:
+This repository is a Claude Code plugin marketplace, so you install it by its GitHub address.
 
-```bash
-git clone https://github.com/ohgi07/codex-skill.git ~/.claude/skills/codex
+**Claude Code in a terminal** — enter these inside a Claude Code session:
+
+```text
+/plugin marketplace add ohgi07/codex-skill
+/plugin install codex@codex-skill
 ```
 
-Restart Claude Code (or start a new session) and the `codex` skill appears in its skill list. The folder must be
-named `codex`: `SKILL.md` calls the wrapper at `~/.claude/skills/codex/scripts/codex-run.sh`.
+From an ordinary shell prompt, the same thing is:
+
+```bash
+claude plugin marketplace add ohgi07/codex-skill
+claude plugin install codex@codex-skill
+```
+
+**Claude Desktop (Code tab)** — open **Customize → Plugins → Add → Add marketplace**, choose **Add from a
+repository**, paste `https://github.com/ohgi07/codex-skill`, then install **codex** from that marketplace.
+Adding the marketplace alone does not install the plugin.
+
+Start a new session afterwards. The skill shows up as `codex:codex`; you can also just say "ask Codex …".
+
+To update later: `/plugin marketplace update codex-skill`.
 
 ## Using the wrapper directly
 
-Claude normally runs it for you, but it works on its own too:
+Claude normally runs it for you, but it works on its own too. From a clone of this repository:
 
 ```bash
-~/.claude/skills/codex/scripts/codex-run.sh --help
+skills/codex/scripts/codex-run.sh --help
 
-~/.claude/skills/codex/scripts/codex-run.sh review -C "/path/to/project" --uncommitted
+skills/codex/scripts/codex-run.sh review -C "/path/to/project" --uncommitted
 
-~/.claude/skills/codex/scripts/codex-run.sh ask -C "/path/to/project" --effort high <<'EOF'
+skills/codex/scripts/codex-run.sh ask -C "/path/to/project" --effort high <<'EOF'
 What are the risks of moving session storage from Redis to Postgres? Read src/session/ first.
 EOF
 ```

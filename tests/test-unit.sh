@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Unit tests for scripts/codex-run.sh. No network: a fake `codex` is put on PATH.
+# Unit tests for skills/codex/scripts/codex-run.sh. No network: a fake `codex` is put on PATH.
 # Run: bash tests/test-unit.sh
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN="$HERE/../scripts/codex-run.sh"
+RUN="$HERE/../skills/codex/scripts/codex-run.sh"
 WORK="$HERE/.work"
 rm -rf "$WORK"; mkdir -p "$WORK/bin" "$WORK/tmp"
 cp "$HERE/fake-codex" "$WORK/bin/codex"; chmod +x "$WORK/bin/codex"
@@ -683,9 +683,19 @@ assert_eq "guard: no recorded usage passes" "$RC" 0
 unset CODEX_HOME; export CODEX_RUN_USAGE_LIMIT=off
 
 # ---------------------------------------------------------------- SKILL.md
-SKILL="$HERE/../SKILL.md"
+SKILL="$HERE/../skills/codex/SKILL.md"
 assert_eq "SKILL.md frontmatter opens" "$(head -n 1 "$SKILL" 2>/dev/null)" "---"
 assert_contains "SKILL.md name" "$(head -n 5 "$SKILL" 2>/dev/null)" "name: codex"
+assert_contains "SKILL.md calls the wrapper via CLAUDE_SKILL_DIR" "$(cat "$SKILL")" '"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh"'
+assert_not_contains "SKILL.md has no hard-coded install path" "$(cat "$SKILL")" "~/.claude/skills"
+
+# ---------------------------------------------------------------- plugin manifests
+PLUGIN_JSON="$(cat "$HERE/../.claude-plugin/plugin.json" 2>/dev/null)"
+MARKET_JSON="$(cat "$HERE/../.claude-plugin/marketplace.json" 2>/dev/null)"
+assert_contains "plugin.json name" "$PLUGIN_JSON" '"name": "codex"'
+assert_contains "plugin.json skills dir" "$PLUGIN_JSON" '"skills": "./skills/"'
+assert_contains "marketplace.json lists the plugin" "$MARKET_JSON" '"name": "codex"'
+assert_contains "marketplace.json source is the repo root" "$MARKET_JSON" '"source": "./"'
 
 # ---------------------------------------------------------------- summary
 echo

@@ -1,0 +1,21 @@
+{
+  "name": "codex-skill",
+  "metadata": {
+    "description": "Claude Code plugin that calls the local OpenAI Codex CLI for reviews, second opinions and delegated tasks."
+  },
+  "owner": {
+    "name": "ohgi07"
+  },
+  "plugins": [
+    {
+      "name": "codex",
+      "description": "Let Claude call the local OpenAI Codex CLI for a second opinion, a code review, or a delegated task, and verify Codex's work.",
+      "author": {
+        "name": "ohgi07"
+      },
+      "source": "./",
+      "category": "development",
+      "homepage": "https://github.com/ohgi07/codex-skill"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "codex",
+  "version": "1.0.0",
+  "description": "Let Claude call the local OpenAI Codex CLI for a second opinion, a code review, or a delegated task, and verify Codex's work.",
+  "author": {
+    "name": "ohgi07"
+  },
+  "homepage": "https://github.com/ohgi07/codex-skill",
+  "repository": "https://github.com/ohgi07/codex-skill",
+  "license": "MIT",
+  "keywords": ["codex", "openai", "code-review", "second-opinion", "delegate"],
+  "skills": "./skills/"
+}

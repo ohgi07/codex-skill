@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Unit tests for skills/codex/scripts/codex-run.sh. No network: a fake `codex` is put on PATH.
-# Run: bash tests/test-unit.sh
+# Run: bash tests/test-unit.sh   (CODEX_TEST_SERIAL=1 runs the lanes one after another, for debugging)
+#
+# The tests are split into lanes (lane_* functions below) that run in parallel, each in its own subshell
+# with its own WORK and TMPDIR. On Windows every process launch costs ~0.1s, so the run is bound by how
+# many processes start, not by CPU; the helpers avoid launching external commands where a builtin will do.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$HERE/../skills/codex/scripts/codex-run.sh"
-WORK="$HERE/.work"
-rm -rf "$WORK"; mkdir -p "$WORK/bin" "$WORK/tmp"
-cp "$HERE/fake-codex" "$WORK/bin/codex"; chmod +x "$WORK/bin/codex"
-export PATH="$WORK/bin:$PATH"
-export TMPDIR="$WORK/tmp"
+WORK_ROOT="$HERE/.work"
+rm -rf "$WORK_ROOT"; mkdir -p "$WORK_ROOT/bin"
+cp "$HERE/fake-codex" "$WORK_ROOT/bin/codex"; chmod +x "$WORK_ROOT/bin/codex"
+export PATH="$WORK_ROOT/bin:$PATH"
 export CODEX_RUN_USAGE_LIMIT=off   # the guard reads the real ~/.codex; tests that cover it set a limit and a fixture CODEX_HOME
-export FAKE_CODEX_ARGS="$WORK/args"
-export FAKE_CODEX_STDIN="$WORK/stdin"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "ok   - $1"; }
@@ -22,9 +23,15 @@ assert_contains()     { case "$2" in *"$3"*) ok "$1";; *) fail "$1" "missing [$3
 assert_not_contains() { case "$2" in *"$3"*) fail "$1" "unexpected [$3] in: $2";; *) ok "$1";; esac; }
 has_arg()  { grep -qx -- "$1" "$FAKE_CODEX_ARGS"; }
 args_str() { local a=(); [ -f "$FAKE_CODEX_ARGS" ] && mapfile -t a < "$FAKE_CODEX_ARGS"; [ ${#a[@]} -eq 0 ] || printf '%s ' "${a[@]}"; }
-reset_fake() {
-  rm -f "$FAKE_CODEX_ARGS" "$FAKE_CODEX_STDIN"
+reset_fake() {   # fresh file names each call, so nothing has to be deleted (an `rm` per test adds up)
+  FAKE_N=$((FAKE_N + 1))
+  export FAKE_CODEX_ARGS="$WORK/args.$FAKE_N" FAKE_CODEX_STDIN="$WORK/stdin.$FAKE_N"
   unset FAKE_CODEX_THREAD FAKE_CODEX_MSG FAKE_CODEX_RC FAKE_CODEX_TOUCH FAKE_CODEX_EVAL CODEX_RUN_KEEP_LOG
+}
+lane_setup() {   # NAME : per-lane WORK and TMPDIR
+  WORK="$WORK_ROOT/$1"; mkdir -p "$WORK/tmp"
+  export TMPDIR="$WORK/tmp"
+  FAKE_N=0; reset_fake
 }
 # run_wrapper ARGS... : runs the wrapper; sets RC, OUT (stdout), ERR (stderr). stdin is inherited.
 run_wrapper() {
@@ -32,12 +39,53 @@ run_wrapper() {
   bash "$RUN" "$@" >"$o" 2>"$e"; RC=$?
   OUT="$(<"$o")"; ERR="$(<"$e")"
 }
-log_count() { find "$TMPDIR/codex-run" -type f 2>/dev/null | wc -l | tr -d ' '; }
+log_count() { local f; shopt -s nullglob; f=("$TMPDIR"/codex-run/*); shopt -u nullglob; echo "${#f[@]}"; }
 # Platform-specific argv the wrapper adds (Windows needs Codex's Windows sandbox backend enabled).
 case "${OSTYPE:-}" in msys*|cygwin*) PLAT=' -c windows.sandbox="unelevated"';; *) PLAT='';; esac
 RO_POLICY=' -c approval_policy="never"'
 WW_POLICY=' -c sandbox_mode="workspace-write" -c approval_policy="on-request" -c approvals_reviewer="auto_review"'
 
+GIT=(git -c user.name=t -c user.email=t@t)
+mk_repo() {   # a.txt committed, b.txt committed then modified (pre-existing change)
+  REPO="$WORK/report-repo"; rm -rf "$REPO"; mkdir -p "$REPO"
+  git -C "$REPO" init -q
+  printf 'one\n' > "$REPO/a.txt"; printf 'one\n' > "$REPO/b.txt"
+  "${GIT[@]}" -C "$REPO" add . && "${GIT[@]}" -C "$REPO" commit -q -m init
+  printf 'two\n' >> "$REPO/b.txt"
+}
+repo_json() { (cd "$REPO" && (pwd -W 2>/dev/null || pwd) | sed 's#/#\\\\#g'); }   # C:\\Users\\... as in the JSON
+
+# Fixture CODEX_HOME shaped like the real one (Codex 0.154.0 rollout files): session_meta on line 1,
+# a turn_context line, and (for sessions that completed a turn) a token_count event with rate limits.
+SID_A="aaaaaaaa-0000-4000-8000-00000000000a"   # in REPO, has usage, newest in REPO
+SID_B="bbbbbbbb-0000-4000-8000-00000000000b"   # elsewhere, has usage, newest overall
+SID_C="cccccccc-0000-4000-8000-00000000000c"   # in REPO, failed before any usage
+SID_G="99999999-0000-4000-8000-000000000099"   # in REPO, newest, but a guardian_review thread (auto reviewer)
+mk_rollout() { # file id cwd_json model sandbox approval [usage_line] ; MK_SOURCE overrides thread_source
+  { printf '{"timestamp":"2026-09-16T10:03:27.663Z","ordinal":0,"type":"session_meta","payload":{"session_id":"%s","id":"%s","timestamp":"2026-09-16T10:03:27.485Z","cwd":"%s","originator":"codex_exec","cli_version":"0.154.0","source":"exec","thread_source":"%s"}}\n' "$2" "$2" "$3" "${MK_SOURCE:-user}"
+    printf '{"timestamp":"2026-09-16T10:03:29.636Z","ordinal":5,"type":"turn_context","payload":{"turn_id":"t","cwd":"%s","approval_policy":"%s","sandbox_policy":{"type":"%s"},"model":"%s","effort":"medium","summary":"auto"}}\n' "$3" "$6" "$5" "$4"
+    [ -z "${7-}" ] || printf '%s\n' "$7"
+  } > "$1"
+}
+usage_json() { # total input cached output pct5h pctweek plan
+  printf '{"timestamp":"2026-09-16T10:03:25.926Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%s,"cached_input_tokens":%s,"cache_write_input_tokens":0,"output_tokens":%s,"reasoning_output_tokens":0,"total_tokens":%s},"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":%s,"window_minutes":300,"resets_at":1789568043},"secondary":{"used_percent":%s,"window_minutes":10080,"resets_at":1790088680},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"%s","rate_limit_reached_type":null}}}' "$2" "$3" "$4" "$1" "$5" "$6" "$7"
+}
+mk_codex_home() {   # sets REPO, REPO_JSON, CH and exports CODEX_HOME
+  REPO="$WORK/repo"; mkdir -p "$REPO"
+  REPO_JSON="$(repo_json)"
+  CH="$WORK/codex-home"; rm -rf "$CH"; mkdir -p "$CH/sessions/2026/09/15" "$CH/sessions/2026/09/16"
+  printf '%s\n' 'model = "cfg-model"' 'model_reasoning_effort = "high"' 'approvals_reviewer = "auto_review"' \
+    '[projects."x"]' 'model = "not-this-one"' > "$CH/config.toml"
+  mk_rollout "$CH/sessions/2026/09/15/rollout-2026-09-15T09-00-00-$SID_C.jsonl" "$SID_C" "$REPO_JSON" "bad-model" "read-only" "never"
+  mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-00-00-$SID_A.jsonl" "$SID_A" "$REPO_JSON" "model-a" "workspace-write" "on-request" \
+    "$(usage_json 24786 24539 11776 247 19.0 34.0 plus)"
+  mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T11-00-00-$SID_B.jsonl" "$SID_B" 'D:\\elsewhere' "model-b" "read-only" "never" \
+    "$(usage_json 500 400 0 100 77.5 88.0 pro)"
+  MK_SOURCE=guardian_review mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-30-00-$SID_G.jsonl" "$SID_G" "$REPO_JSON" "codex-auto-review" "read-only" "never"
+  export CODEX_HOME="$CH"
+}
+
+lane_basic() {   # usage validation, ask
 # ---------------------------------------------------------------- usage validation (no codex call)
 reset_fake; run_wrapper
 assert_eq "no args -> rc 1" "$RC" 1
@@ -103,7 +151,7 @@ assert_contains "ask -m leading-dash value -> message" "$ERR" "-m needs a model"
 # TTY guard: source the script and stub stdin_is_tty
 ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "" ) </dev/null >/dev/null 2>"$WORK/tty.err"; rc=$?
 assert_eq "TTY + no PROMPT -> rc 1" "$rc" 1
-assert_contains "TTY + no PROMPT -> message" "$(cat "$WORK/tty.err")" "stdin is a terminal"
+assert_contains "TTY + no PROMPT -> message" "$(<"$WORK/tty.err")" "stdin is a terminal"
 p="$( ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "given" && printf '%s' "$PROMPT" ) )"
 assert_eq "PROMPT arg wins" "$p" "given"
 p="$( ( source "$RUN"; stdin_is_tty() { return 0; }; resolve_prompt "-" && printf '%s' "$PROMPT" ) <<< "dash" )"
@@ -123,7 +171,7 @@ assert_contains "ask -> argv" "$(args_str)" "--search exec -s read-only${RO_POLI
 assert_not_contains "ask -> no write policy" "$(args_str)" "workspace-write"
 assert_not_contains "ask -> no approve-for-me" "$(args_str)" "approve"
 assert_eq "ask -> prompt via stdin '-'" "$(tail -n 1 "$FAKE_CODEX_ARGS")" "-"
-assert_eq "ask -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "what is this"
+assert_eq "ask -> stdin content" "$(<"$FAKE_CODEX_STDIN")" "what is this"
 assert_contains "ask -> header" "$OUT" "[codex ask] cwd="
 assert_contains "ask -> header model default" "$OUT" "model=default"
 assert_contains "ask -> session line" "$OUT" "session: fake-thread-1"
@@ -136,11 +184,13 @@ line one
 line two
 EOF
 assert_eq "ask heredoc -> rc 0" "$RC" 0
-assert_eq "ask heredoc -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" $'line one\nline two'   # $(...) strips the trailing newline
+assert_eq "ask heredoc -> stdin content" "$(<"$FAKE_CODEX_STDIN")" $'line one\nline two'   # $(...) strips the trailing newline
 assert_contains "ask -m -> argv" "$(args_str)" " -m gpt-test "
 assert_contains "ask --effort -> argv" "$(args_str)" ' -c model_reasoning_effort="high" '
 assert_contains "ask -m -> header" "$OUT" "model=gpt-test"
+}
 
+lane_repo() {   # delegate, failure / log retention, resume, review, platform args, sourced helpers
 # ---------------------------------------------------------------- delegate
 REPO="$WORK/repo"; rm -rf "$REPO"; mkdir -p "$REPO"
 git -C "$REPO" init -q
@@ -199,7 +249,7 @@ assert_contains "resume default -> read-only policy" "$(args_str)" " -c sandbox_
 assert_not_contains "resume default -> no auto_review" "$(args_str)" "auto_review"
 assert_not_contains "resume -> no --color (unsupported on resume)" "$(args_str)" "--color"
 assert_not_contains "resume -> no -s flag" "$(args_str)" " -s "
-assert_eq "resume -> stdin content" "$(cat "$FAKE_CODEX_STDIN")" "follow up"
+assert_eq "resume -> stdin content" "$(<"$FAKE_CODEX_STDIN")" "follow up"
 assert_not_contains "resume read-only -> no trailer" "$OUT" "--- git status after Codex ---"
 
 reset_fake; FAKE_CODEX_TOUCH="$REPO/resumed.txt" run_wrapper resume -C "$REPO" --last --mode workspace-write "write it"
@@ -261,7 +311,7 @@ p="$( ( source "$RUN"; OSTYPE=cygwin; CODEX_RUN_WINDOWS_SANDBOX=elevated set_pla
 assert_eq "Windows (cygwin) + CODEX_RUN_WINDOWS_SANDBOX=elevated" "$p" '-c windows.sandbox="elevated" '
 ( source "$RUN"; OSTYPE=msys; CODEX_RUN_WINDOWS_SANDBOX=disabled set_platform_args ) >/dev/null 2>"$WORK/plat.err"; rc=$?
 assert_eq "CODEX_RUN_WINDOWS_SANDBOX=disabled -> rejected" "$rc" 1
-assert_contains "CODEX_RUN_WINDOWS_SANDBOX=disabled -> message" "$(cat "$WORK/plat.err")" "CODEX_RUN_WINDOWS_SANDBOX"
+assert_contains "CODEX_RUN_WINDOWS_SANDBOX=disabled -> message" "$(<"$WORK/plat.err")" "CODEX_RUN_WINDOWS_SANDBOX"
 
 # ---------------------------------------------------------------- JSON / format helpers (sourced)
 jv_of() { ( source "$RUN"; jv "$1" "$2"; printf '%s' "$JV" ); }
@@ -280,34 +330,11 @@ assert_eq "fmt_time unparsable -> raw"      "$( ( source "$RUN"; fmt_time nonsen
 assert_eq "print_window -> window, trimmed percent, reset time" \
   "$( ( source "$RUN"; print_window '{"window_minutes":300,"used_percent":19.0,"resets_at":1789568043}' window_minutes used_percent resets_at ) )" \
   "  5h window 19% used (resets $(date -d @1789568043 '+%Y-%m-%d %H:%M %z'))"
+}
 
+lane_status() {   # offline status against the fixture CODEX_HOME
 # ---------------------------------------------------------------- status
-# Fixture CODEX_HOME shaped like the real one (Codex 0.154.0 rollout files): session_meta on line 1,
-# a turn_context line, and (for sessions that completed a turn) a token_count event with rate limits.
-CH="$WORK/codex-home"; rm -rf "$CH"; mkdir -p "$CH/sessions/2026/09/15" "$CH/sessions/2026/09/16"
-printf '%s\n' 'model = "cfg-model"' 'model_reasoning_effort = "high"' 'approvals_reviewer = "auto_review"' \
-  '[projects."x"]' 'model = "not-this-one"' > "$CH/config.toml"
-SID_A="aaaaaaaa-0000-4000-8000-00000000000a"   # in REPO, has usage, newest in REPO
-SID_B="bbbbbbbb-0000-4000-8000-00000000000b"   # elsewhere, has usage, newest overall
-SID_C="cccccccc-0000-4000-8000-00000000000c"   # in REPO, failed before any usage
-REPO_JSON="$(cd "$REPO" && (pwd -W 2>/dev/null || pwd) | sed 's#/#\\\\#g')"   # C:\\Users\\... as in the JSON
-SID_G="99999999-0000-4000-8000-000000000099"   # in REPO, newest, but a guardian_review thread (auto reviewer)
-mk_rollout() { # file id cwd_json model sandbox approval [usage_line] ; MK_SOURCE overrides thread_source
-  { printf '{"timestamp":"2026-09-16T10:03:27.663Z","ordinal":0,"type":"session_meta","payload":{"session_id":"%s","id":"%s","timestamp":"2026-09-16T10:03:27.485Z","cwd":"%s","originator":"codex_exec","cli_version":"0.154.0","source":"exec","thread_source":"%s"}}\n' "$2" "$2" "$3" "${MK_SOURCE:-user}"
-    printf '{"timestamp":"2026-09-16T10:03:29.636Z","ordinal":5,"type":"turn_context","payload":{"turn_id":"t","cwd":"%s","approval_policy":"%s","sandbox_policy":{"type":"%s"},"model":"%s","effort":"medium","summary":"auto"}}\n' "$3" "$6" "$5" "$4"
-    [ -z "${7-}" ] || printf '%s\n' "$7"
-  } > "$1"
-}
-usage_json() { # total input cached output pct5h pctweek plan
-  printf '{"timestamp":"2026-09-16T10:03:25.926Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%s,"cached_input_tokens":%s,"cache_write_input_tokens":0,"output_tokens":%s,"reasoning_output_tokens":0,"total_tokens":%s},"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":2},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":%s,"window_minutes":300,"resets_at":1789568043},"secondary":{"used_percent":%s,"window_minutes":10080,"resets_at":1790088680},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"%s","rate_limit_reached_type":null}}}' "$2" "$3" "$4" "$1" "$5" "$6" "$7"
-}
-mk_rollout "$CH/sessions/2026/09/15/rollout-2026-09-15T09-00-00-$SID_C.jsonl" "$SID_C" "$REPO_JSON" "bad-model" "read-only" "never"
-mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-00-00-$SID_A.jsonl" "$SID_A" "$REPO_JSON" "model-a" "workspace-write" "on-request" \
-  "$(usage_json 24786 24539 11776 247 19.0 34.0 plus)"
-mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T11-00-00-$SID_B.jsonl" "$SID_B" 'D:\\elsewhere' "model-b" "read-only" "never" \
-  "$(usage_json 500 400 0 100 77.5 88.0 pro)"
-MK_SOURCE=guardian_review mk_rollout "$CH/sessions/2026/09/16/rollout-2026-09-16T10-30-00-$SID_G.jsonl" "$SID_G" "$REPO_JSON" "codex-auto-review" "read-only" "never"
-export CODEX_HOME="$CH"
+mk_codex_home
 
 reset_fake; run_wrapper status
 assert_eq "status -> rc 0" "$RC" 0
@@ -366,11 +393,13 @@ reset_fake; CODEX_HOME="$WORK/no-such-home" run_wrapper status
 assert_eq "status with no sessions dir -> rc 0" "$RC" 0
 assert_contains "status with no sessions dir -> limits unknown" "$OUT" "limits:  (no usage recorded yet)"
 assert_contains "status with no config -> defaults" "$OUT" "config:  model=(default)  effort=(default)  approvals_reviewer=(default)"
+}
 
+lane_resets() {   # status --resets / --use-reset
 # ---------------------------------------------------------------- status --resets / --use-reset (fake app-server)
 # Result objects shaped like Codex 0.163.0's account/rateLimits/read. rateLimitsByLimitId holds a decoy bucket
 # (1h window, plan=other) that must not leak into the limits line.
-export FAKE_APP_LOG="$WORK/app.log"
+mk_codex_home
 live_read() { # pct5h pctweek count credits_json
   printf '{"ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","limitName":null,"normalModelSlug":null,"primary":{"usedPercent":%s,"windowDurationMins":300,"resetsAt":1792599994},"secondary":{"usedPercent":%s,"windowDurationMins":10080,"resetsAt":1793091641},"credits":{"hasCredits":false,"unlimited":false,"balance":"0"},"individualLimit":null,"spendControlReached":false,"planType":"plus","rateLimitReachedType":null},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":1,"windowDurationMins":60,"resetsAt":1},"secondary":null,"planType":"other"}},"rateLimitResetCredits":{"availableCount":%s,"credits":%s},"accountId":"acc","rateLimitUpsell":null}' "$1" "$2" "$3" "$4"
 }
@@ -379,10 +408,10 @@ credit() { # id expiresAt [title_json_body] [description_json_body]
     "$1" "$2" "${3:-Full reset (Weekly + 5 hr)}" "${4:-Thanks for using Codex!}"
 }
 reset_app() {
-  reset_fake; rm -f "$FAKE_APP_LOG"
+  reset_fake; export FAKE_APP_LOG="$WORK/app.$FAKE_N.log"
   unset FAKE_APP_READ FAKE_APP_READ_AFTER FAKE_APP_READ_ERROR FAKE_APP_OUTCOME FAKE_APP_EXIT FAKE_APP_NOISE FAKE_APP_HANG
 }
-app_log() { [ -f "$FAKE_APP_LOG" ] && cat "$FAKE_APP_LOG"; }
+app_log() { [ -f "$FAKE_APP_LOG" ] && printf '%s\n' "$(<"$FAKE_APP_LOG")"; }
 TWO_CREDITS="[$(credit RateLimitResetCredit_late 1794002027),$(credit RateLimitResetCredit_early 1792698821)]"
 
 reset_app; export FAKE_APP_READ="$(live_read 98.0 15 2 "$TWO_CREDITS")"; run_wrapper status --resets
@@ -513,16 +542,10 @@ assert_contains "resume --use-reset -> message" "$ERR" "only valid for status"
 reset_app
 unset FAKE_APP_LOG
 unset CODEX_HOME
-
-# ---------------------------------------------------------------- change report / --verify
-GIT=(git -c user.name=t -c user.email=t@t)
-mk_repo() {   # a.txt committed, b.txt committed then modified (pre-existing change)
-  REPO="$WORK/report-repo"; rm -rf "$REPO"; mkdir -p "$REPO"
-  git -C "$REPO" init -q
-  printf 'one\n' > "$REPO/a.txt"; printf 'one\n' > "$REPO/b.txt"
-  "${GIT[@]}" -C "$REPO" add . && "${GIT[@]}" -C "$REPO" commit -q -m init
-  printf 'two\n' >> "$REPO/b.txt"
 }
+
+lane_report() {   # change report after write runs
+# ---------------------------------------------------------------- change report / --verify
 mk_repo
 reset_fake; FAKE_CODEX_EVAL='printf "more\n" >> a.txt; printf "x\ny\n" > new.txt' run_wrapper delegate -C "$REPO" "edit"
 assert_eq "report -> rc 0" "$RC" 0
@@ -590,7 +613,9 @@ assert_contains "report nogit -> lists new file" "$OUT" "  fresh.txt"
 assert_not_contains "report nogit -> old file not listed" "$OUT" "old.txt"
 assert_eq "report nogit -> marker file cleaned up" "$(find "$TMPDIR/codex-run" -name "marker.*" 2>/dev/null | wc -l | tr -d " ")" 0
 rm -rf "$NOGIT"
+}
 
+lane_verify() {   # --verify
 mk_repo
 reset_fake; run_wrapper delegate -C "$REPO" --verify "echo all-green" "edit"
 assert_eq "verify pass -> rc 0" "$RC" 0
@@ -615,8 +640,11 @@ assert_eq "--verify on read-only resume -> rc 1" "$RC" 1
 assert_contains "--verify on read-only resume -> message" "$ERR" "--verify needs resume --mode workspace-write"
 reset_fake; run_wrapper delegate -C "$REPO" --verify
 assert_eq "--verify without command -> rc 1" "$RC" 1
+}
 
+lane_guard() {   # usage guard
 # ---------------------------------------------------------------- usage guard
+mk_repo; REPO_JSON="$(repo_json)"
 UCH="$WORK/usage-home"; rm -rf "$UCH"; mkdir -p "$UCH/sessions/2026/10/01"
 SID_U="dddddddd-0000-4000-8000-00000000000d"
 FUT='s/1789568043/4102444800/; s/1790088680/4102444800/'   # push both reset times far into the future
@@ -681,6 +709,28 @@ rm -rf "$UCH/sessions"
 reset_fake; run_wrapper delegate -C "$REPO" "edit"
 assert_eq "guard: no recorded usage passes" "$RC" 0
 unset CODEX_HOME; export CODEX_RUN_USAGE_LIMIT=off
+}
+
+# ---------------------------------------------------------------- run the lanes
+LANES=(lane_basic lane_repo lane_status lane_resets lane_report lane_verify lane_guard)
+run_lane() {   # NAME : output to .work/NAME.out, "PASS FAIL" to .work/NAME.count
+  ( lane_setup "$1"; "$1"; echo "$PASS $FAIL" > "$WORK_ROOT/$1.count" ) > "$WORK_ROOT/$1.out" 2>&1
+}
+if [ "${CODEX_TEST_SERIAL:-0}" = 1 ]; then
+  for lane in "${LANES[@]}"; do run_lane "$lane"; done
+else
+  for lane in "${LANES[@]}"; do run_lane "$lane" & done
+  wait
+fi
+for lane in "${LANES[@]}"; do
+  echo "# $lane"
+  printf '%s\n' "$(<"$WORK_ROOT/$lane.out")"
+  if [ -f "$WORK_ROOT/$lane.count" ] && read -r p f < "$WORK_ROOT/$lane.count"; then
+    PASS=$((PASS + p)); FAIL=$((FAIL + f))
+  else
+    fail "$lane finished" "the lane aborted before its last test; see its output above"
+  fi
+done
 
 # ---------------------------------------------------------------- SKILL.md
 SKILL="$HERE/../skills/codex/SKILL.md"

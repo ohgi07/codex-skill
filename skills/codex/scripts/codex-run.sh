@@ -83,7 +83,11 @@ resolve_prompt() {
 # extract_thread_id FILE -> prints the thread_id from the first thread.started event, or nothing.
 extract_thread_id() {
   [ -f "${1-}" ] || return 0
-  grep '"type":"thread\.started"' "$1" 2>/dev/null | sed -n 's/.*"thread_id":"\([^"]*\)".*/\1/p' | head -n 1 || true
+  local line   # pure bash: thread.started is normally the first event, and each process launch is slow on Windows
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ $line == *'"type":"thread.started"'* && $line =~ \"thread_id\":\"([^\"]*)\" ]] || continue
+    printf '%s\n' "${BASH_REMATCH[1]}"; return 0
+  done < "$1"
 }
 
 looks_like_uuid() {
@@ -850,12 +854,12 @@ run_live() {   # run_live [ROLLOUT_FILE]
 }
 
 cleanup() {
+  local drop_log="$LOG"
   if { [ "${KEEP_LOG:-0}" = 1 ] || [ "${CODEX_RUN_KEEP_LOG:-0}" = 1 ]; } && [ -s "$LOG" ]; then
     echo "codex-run: events log kept at $LOG" >&2
-  else
-    rm -f "$LOG"
+    drop_log=""
   fi
-  rm -f "$OUT_FILE" "$ERR_FILE" "$MARKER"
+  rm -f "$drop_log" "$OUT_FILE" "$ERR_FILE" "$MARKER"
 }
 
 main() {

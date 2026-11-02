@@ -60,7 +60,11 @@ Env:    CODEX_RUN_KEEP_LOG=1                keeps the raw JSONL event log even o
                                             the default \"unelevated\" restricted-token one."
 }
 
-die() { echo "codex-run: $*" >&2; exit 1; }
+# error_kind KIND [DETAIL...] -> one machine-greppable "codex-run: error=KIND ..." line on stderr. Exit codes
+# alone cannot say who failed: Codex's own exit code is passed through and may be any number.
+error_kind() { echo "codex-run: error=$*" >&2; }
+
+die() { echo "codex-run: $*" >&2; error_kind args; exit 1; }
 
 stdin_is_tty() { [ -t 0 ]; }
 
@@ -254,6 +258,7 @@ report_failure() {
   local rc="$1"
   KEEP_LOG=1
   echo "codex-run: codex exited with status $rc" >&2
+  error_kind codex_exit "codex_rc=$rc"
   [ -s "$ERR_FILE" ] && tail -n 20 "$ERR_FILE" >&2
   grep -E '"type":"(error|turn\.failed)"' "$LOG" 2>/dev/null | tail -n 5 >&2 || true
   if [ -s "$OUT_FILE" ]; then
@@ -302,6 +307,7 @@ usage_guard() {
   jv "$line" timestamp
   echo "codex-run: usage guard: ${hit#  } (limit ${limit}%; last recorded reading, $(fmt_time "$JV"))" >&2
   echo "codex-run: nothing was started. Tell the user, then re-run with --ignore-usage to proceed (live numbers: status --resets)." >&2
+  error_kind usage_guard
   exit 3
 }
 
@@ -312,7 +318,7 @@ usage_guard() {
 # phrases in Codex's message that signal incomplete work, and the result of the optional --verify command.
 
 declare -A SNAP_BEFORE=() SNAP_AFTER=()
-GIT_TOP=""; HEAD_BEFORE=""; MARKER=""
+GIT_TOP=""; HEAD_BEFORE=""; MARKER=""; REPORT_NOTE=""
 
 is_write_run() {
   [ "$MODE" = delegate ] || { [ "$MODE" = resume ] && [ "$RESUME_MODE" = workspace-write ]; }
@@ -356,7 +362,8 @@ snapshot_before() {
 # report_warn TEXT -> one "  - TEXT" line; counts toward the summary.
 report_warn() { echo "  - $1"; REPORT_WARNS=$((REPORT_WARNS + 1)); }
 
-# message_signals -> up to 5 lines of Codex's final message that read like incomplete work.
+# message_signals -> up to 5 lines of Codex's final message that read like incomplete work. The match is
+# deliberately broad ("Fixed the sandbox issue" matches too), so these are printed as hints, not warnings.
 message_signals() {
   [ -s "$OUT_FILE" ] || return 0
   grep -iE "could not|couldn't|cannot|can't|unable to|skipped|not run|did not run|failed|blocked|sandbox|못했|못 |불가|실패|건너|생략" "$OUT_FILE" 2>/dev/null \
@@ -381,7 +388,8 @@ print_change_report() {   # print_change_report RUN_RC
         < <(git -C "$GIT_TOP" -c core.quotepath=off diff HEAD --numstat -- "${changed[@]}" 2>/dev/null || true)
     fi
     touched="${#changed[@]}"
-    echo "files touched by Codex: $touched   (changes already present before the run and left alone: $untouched)"
+    # "changed during the run", not "by Codex": the snapshot sees state, not who wrote it.
+    echo "files changed during the run: $touched   (changes already present before the run and left alone: $untouched)"
     for p in "${changed[@]}"; do
       a="${SNAP_AFTER[$p]-}"; b="${SNAP_BEFORE[$p]-}"
       if [ -z "$a" ]; then label="clean  "; else label="${a:0:2} "; fi
@@ -405,16 +413,28 @@ print_change_report() {   # print_change_report RUN_RC
     for p in "${changed[@]}"; do echo "  ${p#./}"; done
   fi
 
+  # Warnings are observed facts only; phrases in Codex's message go under "message hints" below.
   echo "warnings:"
+  [ -z "$REPORT_NOTE" ] || report_warn "$REPORT_NOTE"
   if [ "$rc" -ne 0 ]; then report_warn "Codex exited with status $rc; the files above may be half-done and nothing was rolled back"; fi
   if [ "$touched" -eq 0 ] && [ "$rc" -eq 0 ] && [ "${head_after-}" = "$HEAD_BEFORE" ]; then report_warn "no files changed"; fi
   if [ -n "$GIT_TOP" ] && [ "$head_after" != "$HEAD_BEFORE" ]; then report_warn "HEAD moved: Codex committed despite 'Do not commit' (see SKILL.md rule 8)"; fi
   if [ "$rc" -eq 0 ] && [ ! -s "$OUT_FILE" ]; then report_warn "Codex's final message is empty"; fi
-  while IFS= read -r line; do [ -z "$line" ] || report_warn "message says: $line"; done < <(message_signals)
   [ "$REPORT_WARNS" -gt 0 ] || echo "  (none)"
 
-  if [ -n "$VERIFY_CMD" ] && [ "$rc" -eq 0 ]; then run_verify; else
-    [ -z "$VERIFY_CMD" ] || echo "verify: skipped (Codex failed)"
+  local -a hints=()
+  mapfile -t hints < <(message_signals)
+  if [ "${#hints[@]}" -gt 0 ] && [ -n "${hints[0]}" ]; then
+    echo "message hints (phrases worth checking in Codex's reply; not a verdict):"
+    for line in "${hints[@]}"; do [ -z "$line" ] || echo "  - $line"; done
+  fi
+
+  if [ -z "$VERIFY_CMD" ]; then :
+  elif [ "$rc" -ne 0 ]; then echo "verify: skipped (Codex failed)"
+  elif [ -n "$REPORT_NOTE" ]; then echo "verify: skipped (session was not resumed)"
+  else
+    echo "(the list above was taken before --verify ran; files the command creates are not in it)"
+    run_verify
   fi
 }
 
@@ -426,6 +446,7 @@ run_verify() {
   if command -v timeout >/dev/null 2>&1; then
     timeout -k 5 "${CODEX_RUN_VERIFY_TIMEOUT:-600}" bash -c "$VERIFY_CMD" </dev/null >"$vout" 2>&1 || VERIFY_RC=$?
   else
+    echo "verify: note: no 'timeout' command on PATH; running without the ${CODEX_RUN_VERIFY_TIMEOUT:-600}s limit"
     bash -c "$VERIFY_CMD" </dev/null >"$vout" 2>&1 || VERIFY_RC=$?
   fi
   if [ "$VERIFY_RC" -eq 0 ]; then echo "verify: PASSED  \$ $VERIFY_CMD"
@@ -440,19 +461,30 @@ run_json_mode() {
   local rc=0
   snapshot_before
   printf '%s' "$PROMPT" | "${CMD[@]}" >"$LOG" 2>"$ERR_FILE" || rc=$?
+
+  # The session id is printed on every path, failures included: it is what a follow-up `resume` needs.
+  local tid; tid="$(extract_thread_id "$LOG")"
   if [ "$rc" -ne 0 ]; then
+    [ -z "$tid" ] || echo "session: $tid"
     report_failure "$rc"
     ! is_write_run || print_change_report "$rc"
     return "$rc"
   fi
 
-  local tid; tid="$(extract_thread_id "$LOG")"
   if [ "$MODE" = resume ] && [ -n "$SESSION_ID" ]; then
     if [ -z "$tid" ]; then
       echo "codex-run: warning: no thread.started event; could not verify that session $SESSION_ID was resumed" >&2
     elif [ "${tid,,}" != "${SESSION_ID,,}" ]; then
+      # A write-mode run may already have changed files in the new thread, so the change report still runs;
+      # --verify does not, since this is not the run that was asked for.
       KEEP_LOG=1
       echo "codex-run: requested session $SESSION_ID but codex started thread $tid; session was NOT resumed" >&2
+      error_kind session_mismatch "requested=$SESSION_ID started=$tid"
+      echo "session: $tid   (a NEW thread, not the requested $SESSION_ID)"
+      if is_write_run; then
+        REPORT_NOTE="session was NOT resumed: Codex ran in a new thread $tid without the earlier context"
+        print_change_report 0
+      fi
       return 1
     fi
   fi
@@ -465,7 +497,11 @@ run_json_mode() {
   fi
   if is_write_run; then
     print_change_report 0
-    [ "${VERIFY_RC:-0}" -eq 0 ] || return 4
+    if [ "${VERIFY_RC:-0}" -ne 0 ]; then
+      if [ "$VERIFY_RC" -eq 124 ] || [ "$VERIFY_RC" -eq 137 ]; then error_kind verify_timeout
+      else error_kind verify_failed "verify_rc=$VERIFY_RC"; fi
+      return 4
+    fi
   fi
   return 0
 }
@@ -567,12 +603,23 @@ last_token_count() {
   grep '"type":"token_count"' "$1" 2>/dev/null | tail -n 1 || true
 }
 
-# newest_usage -> "FILE" of the newest rollout that has a token_count event, or nothing.
+# rollouts_by_mtime -> rollout files, most recently written first. A resumed session appends to the rollout it
+# was created with, so the file name (creation time) does not say which file holds the latest reading.
+# Ties keep the name order of all_rollouts. -printf is GNU find (Git Bash, Linux); BSD find (macOS) lacks it,
+# and there the name order is used rather than no list at all.
+rollouts_by_mtime() {
+  [ -d "$CODEX_HOME/sessions" ] || return 0
+  if ! find "$CODEX_HOME/sessions" -maxdepth 0 -printf '' >/dev/null 2>&1; then all_rollouts; return 0; fi
+  find "$CODEX_HOME/sessions" -type f -name 'rollout-*.jsonl' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -k1,1nr -k2r | cut -d' ' -f2-
+}
+
+# newest_usage -> "FILE" of the most recently written rollout that has a token_count event, or nothing.
 newest_usage() {
   local f
   while IFS= read -r f; do
     grep -q '"type":"token_count"' "$f" 2>/dev/null && { printf '%s' "$f"; return 0; }
-  done < <(all_rollouts)
+  done < <(rollouts_by_mtime)
   return 0
 }
 
@@ -868,7 +915,7 @@ main() {
 
   parse_args "$@"
 
-  command -v codex >/dev/null 2>&1 || { echo "codex-run: 'codex' not found on PATH (npm i -g @openai/codex)" >&2; exit 2; }
+  command -v codex >/dev/null 2>&1 || { echo "codex-run: 'codex' not found on PATH (npm i -g @openai/codex)" >&2; error_kind codex_missing; exit 2; }
 
   [ -d "$DIR" ] || die "directory not found: $DIR"
   case "$MODE" in review|status) ;; *) resolve_prompt "$PROMPT_ARG" ;; esac

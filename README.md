@@ -30,8 +30,14 @@ What the wrapper adds on top of `codex exec`:
 - **Status without an API call.** `status` shows the Codex version, login, configured model and effort, and token
   totals of a past session from `~/.codex`; `status --resets` reads live limits and reset credits.
 - **No silent commits.** Delegated prompts end with "Do not commit"; Claude reviews the diff and commits itself.
+- **Failures that say who failed.** Every failure prints a `codex-run: error=<kind>` line (`usage_guard`,
+  `codex_exit codex_rc=N`, `session_mismatch`, `verify_failed`, …), and the session id and change report are
+  printed on failure paths too.
+- **Multi-turn discussions.** "Discuss this with Codex" follows a fixed 2–3 round procedure on one session:
+  independent review, counterpoints per claim, keep/revise/withdraw, then a summary of agreement and open issues.
 
-`skills/codex/SKILL.md` holds the rules Claude follows; `DESIGN.md` explains why the wrapper works the way it does.
+`skills/codex/SKILL.md` holds the rules Claude follows, with details in `skills/codex/references/` that Claude reads
+only when needed; `DESIGN.md` explains why the wrapper works the way it does.
 
 ## Requirements
 

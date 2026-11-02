@@ -215,7 +215,12 @@ assert_contains "codex failure -> stderr tail shown" "$ERR" "fake error on stder
 kept="$(sed -n 's/.*events log kept at \(.*\)$/\1/p' <<< "$ERR" | head -n 1)"
 [ -n "$kept" ] && [ -f "$kept" ] && ok "codex failure -> log file exists" || fail "codex failure -> log file exists" "path=[$kept]"
 assert_contains "codex failure -> partial output shown" "$OUT" "fake answer"
+assert_contains "codex failure -> session id still printed" "$OUT" "session: fake-thread-1"
+assert_contains "codex failure -> error kind names Codex and its code" "$ERR" "codex-run: error=codex_exit codex_rc=3"
 rm -rf "$TMPDIR/codex-run"
+
+reset_fake; run_wrapper ask -C "$WORK/missing-dir" "q"
+assert_contains "argument error -> error=args" "$ERR" "codex-run: error=args"
 
 reset_fake; CODEX_RUN_KEEP_LOG=1 run_wrapper ask -C "$WORK" "q"
 assert_eq "KEEP_LOG success -> rc 0" "$RC" 0
@@ -550,7 +555,7 @@ mk_repo
 reset_fake; FAKE_CODEX_EVAL='printf "more\n" >> a.txt; printf "x\ny\n" > new.txt' run_wrapper delegate -C "$REPO" "edit"
 assert_eq "report -> rc 0" "$RC" 0
 assert_contains "report -> header" "$OUT" "--- codex-run verification ---"
-assert_contains "report -> two files touched" "$OUT" "files touched by Codex: 2"
+assert_contains "report -> two files touched" "$OUT" "files changed during the run: 2"
 assert_contains "report -> pre-existing change left alone" "$OUT" "left alone: 1"
 assert_contains "report -> modified file with numstat" "$OUT" " M a.txt   (+1 -0)"
 assert_contains "report -> new file with line count" "$OUT" "?? new.txt   (new file, 2 lines; read it)"
@@ -562,7 +567,7 @@ assert_contains "report -> touching a pre-existing dirty file is flagged" "$OUT"
 
 mk_repo
 reset_fake; FAKE_CODEX_EVAL='rm a.txt' run_wrapper delegate -C "$REPO" "edit"
-assert_contains "report -> deleted tracked file" "$OUT" "files touched by Codex: 1"
+assert_contains "report -> deleted tracked file" "$OUT" "files changed during the run: 1"
 assert_contains "report -> deleted file listed" "$OUT" " D a.txt"
 
 mk_repo
@@ -570,7 +575,22 @@ reset_fake; run_wrapper delegate -C "$REPO" "edit"
 assert_contains "report -> nothing changed warns" "$OUT" "no files changed"
 
 reset_fake; FAKE_CODEX_MSG="I could not run the tests (sandbox)" run_wrapper delegate -C "$REPO" "edit"
-assert_contains "report -> message signal" "$OUT" "message says: I could not run the tests (sandbox)"
+assert_contains "report -> message phrase shown as a hint" "$OUT" "message hints (phrases worth checking"
+assert_contains "report -> hint text" "$OUT" "  - I could not run the tests (sandbox)"
+assert_not_contains "report -> a hint is not a warning" "$OUT" "message says:"
+
+# Codex said it would resume A but started B; in write mode files may already have changed in B.
+mk_repo
+local want="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" got="99999999-8888-7777-6666-555555555555"
+reset_fake; FAKE_CODEX_THREAD="$got" FAKE_CODEX_EVAL='printf "new\n" > stray.txt' \
+  run_wrapper resume -C "$REPO" "$want" --mode workspace-write --verify "echo SHOULD-NOT-RUN" "go"
+assert_eq "resume mismatch (write) -> rc 1" "$RC" 1
+assert_contains "resume mismatch (write) -> error kind" "$ERR" "codex-run: error=session_mismatch"
+assert_contains "resume mismatch (write) -> new thread named" "$OUT" "session: $got   (a NEW thread"
+assert_contains "resume mismatch (write) -> change report still printed" "$OUT" "?? stray.txt"
+assert_contains "resume mismatch (write) -> warned in the report" "$OUT" "session was NOT resumed: Codex ran in a new thread"
+assert_contains "resume mismatch (write) -> verify skipped" "$OUT" "verify: skipped (session was not resumed)"
+assert_not_contains "resume mismatch (write) -> verify command not run" "$OUT" "SHOULD-NOT-RUN"
 
 reset_fake; FAKE_CODEX_EVAL=': > "$out"' run_wrapper delegate -C "$REPO" "edit"
 assert_contains "report -> empty message warns" "$OUT" "final message is empty"
@@ -625,9 +645,12 @@ reset_fake; run_wrapper delegate -C "$REPO" --verify "echo boom; exit 3" "edit"
 assert_eq "verify fail -> rc 4" "$RC" 4
 assert_contains "verify fail -> FAILED with status" "$OUT" "verify: FAILED (exit 3)"
 assert_contains "verify fail -> output shown" "$OUT" "    boom"
+assert_contains "verify fail -> error kind with the command's code" "$ERR" "codex-run: error=verify_failed verify_rc=3"
+assert_contains "verify -> says the file list predates the command" "$OUT" "taken before --verify ran"
 reset_fake; CODEX_RUN_VERIFY_TIMEOUT=1 run_wrapper delegate -C "$REPO" --verify "sleep 5" "edit"
 assert_eq "verify timeout -> rc 4" "$RC" 4
 assert_contains "verify timeout -> message" "$OUT" "verify: TIMED OUT after 1s"
+assert_contains "verify timeout -> error kind" "$ERR" "codex-run: error=verify_timeout"
 reset_fake; FAKE_CODEX_RC=1 run_wrapper delegate -C "$REPO" --verify "true" "edit"
 assert_contains "verify skipped when Codex failed" "$OUT" "verify: skipped (Codex failed)"
 reset_fake; run_wrapper delegate -C "$REPO" --verify "pwd" "edit"
@@ -705,6 +728,23 @@ mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "
 reset_fake; run_wrapper delegate -C "$REPO" "edit"
 assert_eq "guard: reading whose windows already reset passes" "$RC" 0
 
+# An older session resumed after a newer one was created: its rollout keeps the older name but holds the
+# latest reading. The guard must go by when the file was written, not by its name.
+SID_N="eeeeeeee-0000-4000-8000-00000000000e"; mkdir -p "$UCH/sessions/2026/10/02"
+mk_rollout "$UCH/sessions/2026/10/02/rollout-2026-10-02T09-00-00-$SID_N.jsonl" "$SID_N" "$REPO_JSON" "m" "read-only" "never" \
+  "$(usage_json 10 5 5 1 10.0 10.0 plus | sed "$FUT")"
+mk_rollout "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl" "$SID_U" "$REPO_JSON" "m" "read-only" "never" \
+  "$(usage_json 10 5 5 1 85.0 40.0 plus | sed "$FUT")"
+touch -d '2026-10-02 09:00:00' "$UCH/sessions/2026/10/02/rollout-2026-10-02T09-00-00-$SID_N.jsonl"
+touch -d '2026-10-03 09:00:00' "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: resumed older session holds the latest reading -> rc 3" "$RC" 3
+assert_contains "guard: latest reading is the resumed session's" "$ERR" "5h window 85% used"
+assert_contains "guard: error kind" "$ERR" "codex-run: error=usage_guard"
+touch -d '2026-10-01 09:00:00' "$UCH/sessions/2026/10/01/rollout-2026-10-01T10-00-00-$SID_U.jsonl"
+reset_fake; run_wrapper delegate -C "$REPO" "edit"
+assert_eq "guard: newer-named session written last -> its 10% reading passes" "$RC" 0
+
 rm -rf "$UCH/sessions"
 reset_fake; run_wrapper delegate -C "$REPO" "edit"
 assert_eq "guard: no recorded usage passes" "$RC" 0
@@ -738,6 +778,15 @@ assert_eq "SKILL.md frontmatter opens" "$(head -n 1 "$SKILL" 2>/dev/null)" "---"
 assert_contains "SKILL.md name" "$(head -n 5 "$SKILL" 2>/dev/null)" "name: codex"
 assert_contains "SKILL.md calls the wrapper via CLAUDE_SKILL_DIR" "$(cat "$SKILL")" '"${CLAUDE_SKILL_DIR}/scripts/codex-run.sh"'
 assert_not_contains "SKILL.md has no hard-coded install path" "$(cat "$SKILL")" "~/.claude/skills"
+for ref in consult output status; do
+  [ -s "$HERE/../skills/codex/references/$ref.md" ] && ok "references/$ref.md exists" || fail "references/$ref.md exists"
+  assert_contains "SKILL.md points to references/$ref.md via CLAUDE_SKILL_DIR" "$(cat "$SKILL")" "\${CLAUDE_SKILL_DIR}/references/$ref.md"
+done
+# every error kind the wrapper can print is documented for Claude
+for kind in $(grep -o 'error_kind [a-z_]*' "$RUN" | sed 's/error_kind //' | sort -u); do
+  [ "$kind" != "" ] || continue
+  assert_contains "output.md documents error=$kind" "$(cat "$HERE/../skills/codex/references/output.md")" "\`$kind"
+done
 
 # ---------------------------------------------------------------- plugin manifests
 PLUGIN_JSON="$(cat "$HERE/../.claude-plugin/plugin.json" 2>/dev/null)"

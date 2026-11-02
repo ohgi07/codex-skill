@@ -29,7 +29,8 @@ Follow-up turns on a prior Codex session are supported via `resume`.
 codex-skill/                          # the repo is a Claude Code plugin marketplace
 ├── .claude-plugin/marketplace.json   # marketplace "codex-skill" listing one plugin, source "./"
 ├── .claude-plugin/plugin.json        # plugin "codex"; skills live under ./skills/
-├── skills/codex/SKILL.md             # when/how Claude uses it
+├── skills/codex/SKILL.md             # when/how Claude uses it (core rules; loaded on every trigger)
+├── skills/codex/references/          # read on demand: consult.md (multi-turn discussion), output.md, status.md
 ├── skills/codex/scripts/codex-run.sh # the wrapper (bash, Git Bash compatible)
 ├── DESIGN.md                         # this spec
 ├── tests/fake-codex                  # test double for the `codex` CLI, used by test-unit.sh
@@ -184,6 +185,8 @@ session: <thread id>          # parsed from the --json `thread.started` event; l
 ?? src/bar.ts
 ```
 
+- `session:` is printed on every path where the event stream has a
+  `thread.started` event, Codex failures included (a follow-up `resume` needs it).
 - The trailer is deliberately named "git status after Codex": on an already
   dirty repo it cannot distinguish Codex's edits from pre-existing ones.
   Claude still runs `git diff` itself; the verification report below only
@@ -192,22 +195,44 @@ session: <thread id>          # parsed from the --json `thread.started` event; l
   print a `--- codex-run verification ---` report, also when Codex fails:
   - Snapshot: before the run, every path `git status --porcelain -z` lists,
     with its XY status and the `git hash-object` of the file on disk; after
-    the run the same. A path whose entry differs was touched by Codex; equal
-    entries are counted as "left alone". Outside git: files newer than a marker
+    the run the same. A path whose entry differs is reported as "changed during
+    the run" (the snapshot sees state, not authorship); equal entries are
+    counted as "left alone". Outside git: files newer than a marker
     file (no `.git`/`node_modules`, at most 200).
   - HEAD before/after, with `git log` of any new commits (rule 8).
-  - Warnings: non-zero exit, no files changed, empty final message, and lines
-    of the final message matching "could not / skipped / failed / sandbox ..."
-    (a hint only, not a verdict).
+  - Warnings (observed facts only): non-zero exit, no files changed, empty
+    final message, HEAD moved, session was not resumed.
+  - Message hints, printed apart from the warnings: lines of the final message
+    matching "could not / skipped / failed / sandbox ...". The pattern is broad
+    on purpose and matches success sentences too, so it is not a warning.
+  - Also printed when `resume SESSION_ID` started a different thread in write
+    mode: files may already have changed there. `--verify` is skipped then.
   - `--verify CMD` runs after a successful Codex run, in DIR, outside Codex's
     sandbox, bounded by `CODEX_RUN_VERIFY_TIMEOUT` (600s). Failure or timeout
-    makes the wrapper exit 4; Codex's own failures keep Codex's exit code.
+    makes the wrapper exit 4; Codex's own failures keep Codex's exit code. The
+    file list is taken before the command runs (stated in the report). The
+    command runs before Claude has read the diff, so SKILL.md limits it to
+    tasks that do not touch build/test/CI files.
+
+### `error=<kind>` line
+
+Exit codes cannot identify the failing party: Codex's own exit code is passed
+through and the npm launcher reserves no range for wrappers. Every failure the
+wrapper recognises therefore also prints one `codex-run: error=<kind> [k=v ...]`
+line on stderr: `args`, `codex_missing`, `usage_guard`, `codex_exit codex_rc=N`,
+`session_mismatch requested=A started=B`, `verify_failed verify_rc=N`,
+`verify_timeout`. A full JSON envelope was considered and rejected: the consumer
+is an LLM reading text, and assembling JSON in bash adds escaping risk.
 
 ## Usage guard
 
 `delegate`, `resume --mode workspace-write` and any run with `--effort
 high|xhigh|max` first read the last rate-limit reading Codex recorded in
-`$CODEX_HOME/sessions` (the same offline source as `status`). If a window is at
+`$CODEX_HOME/sessions` (the same offline source as `status`): the newest
+`token_count` event of the most recently *written* rollout file. Rollout file
+names carry the session's creation time, and a resumed session appends to its
+original file, so ordering by name would pick a stale reading. (Needs GNU
+`find -printf`; with BSD find the name order is the fallback.) If a window is at
 or above `CODEX_RUN_USAGE_LIMIT` percent (default 80, `off` disables), the
 wrapper exits 3 before starting anything, so Claude can ask the user. A window
 whose `resets_at` is already past is skipped, since that reading is stale.
@@ -242,9 +267,9 @@ output; it should not accumulate silently.
 | PROMPT omitted and stdin is a TTY (ask/delegate/resume) | usage, exit 1 |
 | empty or whitespace-only prompt for ask/delegate/resume | usage, exit 1 |
 | `-C DIR` missing | message, exit 1 (before invoking codex) |
-| codex exits non-zero | print last 20 lines of codex stderr, print partial `-o` content if present, exit with codex's code, keep JSONL |
+| codex exits non-zero | `session:` line if known, `error=codex_exit codex_rc=N`, last 20 lines of codex stderr, partial `-o` content if present, exit with codex's code, keep JSONL |
 | `review` fails | same as above, except the (always-empty, since `review` writes no JSONL) events log is not kept |
-| `resume SESSION_ID` emitted a different `thread_id` | stderr error, exit 1, keep JSONL |
+| `resume SESSION_ID` emitted a different `thread_id` | stderr error + `error=session_mismatch`, `session:` line naming the new thread, exit 1, keep JSONL; write mode still prints the change report and skips `--verify` |
 | `resume SESSION_ID` given but no `thread.started` event in the stream | warning on stderr, exit code unchanged (cannot verify, does not fail the call) |
 
 ## SKILL.md contents
